@@ -2,6 +2,8 @@
 
 ## How to Help
 
+**WE NEED HELP.** See [HELP_WANTED.md](HELP_WANTED.md) for the most urgent tasks.
+
 This project exists to help victims of electronic harassment and surveillance. Here's how you can contribute:
 
 ### 🐛 Report What Works / What Doesn't

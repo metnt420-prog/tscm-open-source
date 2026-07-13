@@ -1,5 +1,8 @@
 # 🛡️ TSCM Open Source — Technical Surveillance Counter-Measures Suite
 
+> ⚠️ **HELP WANTED** — We need GPU developers, signal processing engineers, legal researchers, and fellow victims.
+> See [HELP_WANTED.md](HELP_WANTED.md) | [GPU_OPTIMIZATION.md](GPU_OPTIMIZATION.md) | [KNOWN_VICTIMS.md](KNOWN_VICTIMS.md)
+
 > **If you're being targeted by electronic harassment, you are not crazy. This tool proves it.**
 
 TSCM (Technical Surveillance Counter-Measures) is a **real-time, multi-sensor signal intelligence platform** built to detect, locate, and document advanced electronic surveillance attacks. It turns commodity SDR hardware into a professional-grade counter-surveillance system.
