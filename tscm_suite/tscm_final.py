@@ -6285,6 +6285,136 @@ class PowerLineHarmonicDetector:
         return results
 
 
+class DopplerShiftDetector:
+    """Detect Doppler shifts on carriers to identify moving surveillance platforms.
+    Drones, circling vehicles, and low-orbit satellites produce measurable Doppler
+    on their transmission carriers. Tracks frequency drift over time on known carriers."""
+    def __init__(self, window_s=30, min_shift_hz=50):
+        self.carrier_history = {}  # freq_rounded -> [(timestamp, freq_exact, snr)]
+        self.window = window_s
+        self.min_shift = min_shift_hz  # Hz - minimum Doppler to report
+
+    def update(self, carrier_freq, snr, timestamp=None):
+        """Record a carrier detection. Returns Doppler info if shift detected."""
+        import time as _t
+        if timestamp is None:
+            timestamp = _t.time()
+        # Round to nearest 10 kHz to group same carrier
+        key = round(carrier_freq / 1e4) * 1e4
+        if key not in self.carrier_history:
+            self.carrier_history[key] = []
+        hist = self.carrier_history[key]
+        hist.append((timestamp, carrier_freq, snr))
+        # Trim to window
+        cutoff = timestamp - self.window
+        while hist and hist[0][0] < cutoff:
+            hist.pop(0)
+        # Need at least 3 samples to measure Doppler rate
+        if len(hist) < 3:
+            return None
+        # Compute frequency shift over window
+        freqs = [h[1] for h in hist]
+        times = [h[0] for h in hist]
+        f_min, f_max = min(freqs), max(freqs)
+        t_span = times[-1] - times[0]
+        if t_span < 1:
+            return None
+        shift_rate = (f_max - f_min) / t_span  # Hz/s
+        total_shift = f_max - f_min
+        if abs(total_shift) < self.min_shift:
+            return None
+        # Estimate radial velocity (v = delta_f * c / f)
+        c = 299792458.0
+        v_radial = total_shift * c / (2 * key)  # factor 2 for reflection
+        return {
+            'carrier': key,
+            'shift_hz': total_shift,
+            'shift_rate': shift_rate,
+            'radial_velocity_ms': v_radial,
+            'samples': len(hist),
+            'classification': 'doppler_moving' if abs(v_radial) > 1 else 'doppler_drift'
+        }
+
+    def get_all_doppler(self):
+        """Check all tracked carriers for Doppler shifts."""
+        import time as _t
+        results = []
+        now = _t.time()
+        stale_keys = []
+        for key, hist in self.carrier_history.items():
+            if hist[-1][0] < now - 60:  # 60s stale
+                stale_keys.append(key)
+                continue
+            if len(hist) < 3:
+                continue
+            freqs = [h[1] for h in hist]
+            times = [h[0] for h in hist]
+            total_shift = max(freqs) - min(freqs)
+            if abs(total_shift) < self.min_shift:
+                continue
+            c = 299792458.0
+            v_radial = total_shift * c / (2 * key)
+            results.append({
+                'carrier': key,
+                'shift_hz': total_shift,
+                'shift_rate': (max(freqs) - min(freqs)) / (times[-1] - times[0]),
+                'radial_velocity_ms': v_radial,
+                'samples': len(hist),
+                'classification': 'doppler_moving' if abs(v_radial) > 1 else 'doppler_drift'
+            })
+        for k in stale_keys:
+            self.carrier_history.pop(k, None)
+        return results
+
+class SignalActivityTracker:
+    """Track RF activity patterns to identify active attack windows.
+    Monitors SNR/bandpower over time across frequency bands to detect
+    when adversaries are actively transmitting vs idle."""
+    def __init__(self, window_s=300, band_width_hz=1e6):
+        self.bands = {}  # band_key -> [(timestamp, power_db, snr)]
+        self.window = window_s
+        self.band_width = band_width_hz
+
+    def update(self, freq, power_db, snr, timestamp=None):
+        import time as _t
+        if timestamp is None:
+            timestamp = _t.time()
+        # Bucket frequency into bands
+        band_key = round(freq / self.band_width)
+        if band_key not in self.bands:
+            self.bands[band_key] = []
+        self.bands[band_key].append((timestamp, power_db, snr))
+        cutoff = timestamp - self.window
+        while self.bands[band_key] and self.bands[band_key][0][0] < cutoff:
+            self.bands[band_key].pop(0)
+
+    def get_active_bands(self, threshold_pct=70):
+        """Return bands with unusual activity (above threshold percentile)."""
+        import numpy as np
+        results = []
+        for band_key, hist in self.bands.items():
+            if len(hist) < 10:
+                continue
+            snrs = [h[2] for h in hist]
+            powers = [h[1] for h in hist]
+            mean_snr = np.mean(snrs)
+            std_snr = np.std(snrs)
+            mean_pwr = np.mean(powers)
+            # Detect bursts: SNR spikes above 2x std dev
+            spikes = sum(1 for s in snrs if s > mean_snr + 2 * std_snr)
+            spike_pct = spikes / len(snrs) * 100
+            if spike_pct > threshold_pct or std_snr > mean_snr * 0.5:
+                results.append({
+                    'band_mhz': band_key * self.band_width / 1e6,
+                    'mean_snr': float(mean_snr),
+                    'std_snr': float(std_snr),
+                    'spike_pct': float(spike_pct),
+                    'samples': len(hist),
+                    'classification': 'active_attack_band' if spike_pct > threshold_pct else 'intermittent'
+                })
+        return sorted(results, key=lambda x: x['std_snr'], reverse=True)
+
+
 class FreqSweep:
     def __init__(self):
         self.hbands=HACKRF_SWEEP;self.bbands=BLADERF_SWEEP
@@ -6375,6 +6505,8 @@ class TSCMSystem:
         # Cell tower detection from BladeRF 2.4 GHz data
         self.cell_tower_detector = CellTowerDetector(rf_fs=Config.BLADERF_SAMPLE_RATE)
         self.power_line_detector = PowerLineHarmonicDetector(fs=Config.HACKRF_SAMPLE_RATE)
+        self.doppler_detector = DopplerShiftDetector(window_s=60, min_shift_hz=30)
+        self.activity_tracker = SignalActivityTracker(window_s=300)
         # Stingray/IMSI catcher detector for 815-690-6926
         self.stingray = StingrayDetector(self.log, target_number="8156906926")
         # Local WiFi geolocation using RSSI + GPS position history
@@ -6944,6 +7076,7 @@ class TSCMSystem:
                             self.detectors['eeg_carrier_mixing'].update_carrier(cf, float(snr))
                             self.fhss_tracker.add_carrier(cf, float(snr), now,
                                 bearing=self.aoa if self.aoa else None, bw=5000, detector='sband')
+                            self.doppler_detector.update(cf, float(snr), now)
                             self.localization.add_observation(
                                 fingerprint=f'sband_carrier_{cf:.0f}'.encode(),
                                 obs_lat=lat, obs_lon=lon,
@@ -7155,6 +7288,7 @@ class TSCMSystem:
                                 self.detectors['pll_resonance'].set_carrier(carrier_freq)
                                 self.fhss_tracker.add_carrier(carrier_freq, float(snr), now,
                                     bearing=self.aoa if self.aoa else None, bw=10000, detector='hackrf')
+                                self.doppler_detector.update(carrier_freq, float(snr), now)
                                 self.localization.add_observation(
                                     fingerprint=f'rf_carrier_{carrier_freq:.0f}'.encode(),
                                     obs_lat=lat, obs_lon=lon,
@@ -7269,6 +7403,7 @@ class TSCMSystem:
                     # RMS 0.001 (noise floor w/LNA) ~1500m, RMS 0.01 ~500m, RMS 0.1 ~100m
                     hackrf_range = max(30, min(2000, 150.0 / max(hackrf_rms, 0.0005)))
                     self.hackrf_range = hackrf_range  # store for downstream detector use
+                    self.activity_tracker.update(h_rf_freq, 20*np.log10(hackrf_rms+1e-12), hackrf_rms*1000, now)
                     if hackrf_rms > 0.001:
                         self.localization.add_observation(
                             fingerprint='hackrf_ferrite',
@@ -8304,6 +8439,19 @@ class TSCMSystem:
                     snr=fh['mean_snr'])
                 self.log.info(f'FHSS: {fh["hop_count"]} hops span={fh["span_mhz"]:.1f}MHz rate={fh["hop_rate"]:.2f}Hz')
 
+            # Doppler shift detection - moving platforms
+            doppler_results = self.doppler_detector.get_all_doppler()
+            for dp in doppler_results:
+                self.log.warning(f'DOPPLER: carrier={dp["carrier"]/1e6:.3f}MHz shift={dp["shift_hz"]:.0f}Hz v_radial={dp["radial_velocity_ms"]:.1f}m/s')
+                fp = f'doppler_{dp["carrier"]:.0f}'.encode()
+                self.localization.add_observation(
+                    fingerprint=fp, obs_lat=lat, obs_lon=lon,
+                    bearing_deg=self.aoa if self.aoa else None,
+                    range_m=None, freq=dp['carrier'],
+                    classification=dp['classification'],
+                    detector_name='doppler_tracker',
+                    snr=dp['shift_hz'] / 100)
+
             # Multipath AoA-based localization
             mp_results = self.detectors['ducting'].estimate_multipath_position(lat, lon)
             for mp in mp_results:
@@ -8329,6 +8477,14 @@ class TSCMSystem:
                         'bearing_direct': mp['bearing_direct'],
                         'bearing_reflected': mp['bearing_reflected']}
                     self.log.info(f"[MPATH] direct={mp['bearing_direct']:.0f}deg reflected={mp['bearing_reflected']:.0f}deg est_dist={mp['estimated_distance']:.0f}m")
+
+            # Signal activity analysis (every 30 cycles)
+            if self.cycle_count % 30 == 0:
+                try:
+                    active_bands = self.activity_tracker.get_active_bands()
+                    for ab in active_bands[:5]:
+                        self.log.info(f'ACTIVITY: {ab["band_mhz"]:.0f}MHz std_snr={ab["std_snr"]:.1f} spikes={ab["spike_pct"]:.0f}% ({ab["classification"]})')
+                except: pass
 
             # 10. WiFi AP scanning with LOCAL geolocation + CSI motion detection
             wigle_aps=[]
