@@ -1,0 +1,43 @@
+{
+  "profile": "advanced",
+  "name": "Full Counter-Surveillance",
+  "cost_estimate": "$800-1000 USD",
+  "description": "Adds BladeRF 2.0 xA9 MIMO SDR. Unlocks direction finding via phase interferometry, passive radar, cross-sensor triangulation, and sub-degree bearing accuracy.",
+  "builds_on": "intermediate",
+  "hardware": {
+    "rtl_sdr": {"required": true, "inherited_from": "intermediate"},
+    "hackrf_one": {"required": true, "inherited_from": "intermediate"},
+    "spyverter": {"required": true, "inherited_from": "intermediate"},
+    "alfa_wifi": {"required": true, "inherited_from": "intermediate"},
+    "laptop_mic": {"required": true, "inherited_from": "intermediate"},
+    "bladerf": {
+      "required": true,
+      "device": "BladeRF 2.0 Micro xA9",
+      "price": "$480-540",
+      "buy": [
+        {"name": "Nuand BladeRF 2.0 Micro xA9", "url": "https://www.nuand.com/bladerf-2/", "price": "$540"},
+        {"name": "Nuand BladeRF 2.0 Micro xA4 (budget)", "url": "https://www.nuand.com/bladerf-2/", "price": "$480"}
+      ],
+      "note": "xA9 has larger FPGA for more DSP. xA4 works but limited FPGA fabric. Both do MIMO.",
+      "setup": "Install bladeRF tools from nuand.com. Windows: bladeRF-win-installer.exe. Linux: apt install bladerf."
+    }
+  },
+  "detects": [
+    "Everything from Tier 2, plus:",
+    "Direction finding via MIMO phase interferometry",
+    "Cross-sensor triangulation (BladeRF AoA + HackRF ferrite bearing)",
+    "Passive radar body detection and imaging",
+    "Sub-degree AoA bearing accuracy",
+    "Real-time wideband IQ capture (61.44 MSps)",
+    "eCPRI injection detection at 3.5 GHz",
+    "Stingray/IMSI catcher detection",
+    "Phased array detection (coherent multi-beam)",
+    "Full operator fingerprinting",
+    "Precise transmitter geolocation"
+  ],
+  "cannot_detect": [
+    "Ultrasound (need Petterson M500 or equivalent)",
+    "EEG/neurological attacks (need TGAM/OpenBCI)",
+    "Centimeter-precision positioning (need GPS RTK)"
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "profile": "professional",
+  "name": "Professional TSCM Suite",
+  "cost_estimate": "$2,000-2,500 USD",
+  "description": "Complete professional counter-surveillance system. Adds ultrasonic detection, EEG monitoring, GPS RTK, and external antenna arrays. What our original system runs.",
+  "builds_on": "advanced",
+  "hardware": {
+    "rtl_sdr": {"required": true, "inherited_from": "advanced"},
+    "hackrf_one": {"required": true, "inherited_from": "advanced"},
+    "spyverter": {"required": true, "inherited_from": "advanced"},
+    "alfa_wifi": {"required": true, "inherited_from": "advanced"},
+    "bladerf": {"required": true, "inherited_from": "advanced"},
+    "laptop_mic": {"required": true, "inherited_from": "advanced"},
+    "petterson_m500": {
+      "required": true,
+      "device": "Petterson M500 Ultrasonic Detector",
+      "price": "$300-400",
+      "buy": [
+        {"name": "Petterson M500", "url": "https://www.batmanagement.com/Petterson.html", "price": "~$350"}
+      ],
+      "alternatives": [
+        {"name": "DIY Ultrasound Mic (MEMS mic + 192 kHz ADC)", "price": "$50-100", "note": "Build your own with an ICS-40720 MEMS mic and USB audio interface supporting 192kHz. Not as sensitive as M500 but works for strong signals."},
+        {"name": "Dodotronic UltraMic 384K EVO", "price": "~$300", "note": "Alternative professional ultrasonic mic."},
+        {"name": "Sanken CO-100K", "price": "~$700", "note": "Studio-grade ultrasonic microphone, 20Hz-100kHz."}
+      ],
+      "setup": "USB plug-and-play. May need to kill zombie processes if already in use."
+    },
+    "gps_rtk": {
+      "required": false,
+      "device": "u-blox ZED-F9P GPS-RTK2",
+      "price": "$200-275",
+      "buy": [
+        {"name": "SparkFun GPS-RTK2 (ZED-F9P)", "url": "https://www.sparkfun.com/products/16481", "price": "$274.95"},
+        {"name": "ArduSimple SimpleRTK2B", "url": "https://www.ardusimple.com/product/simplertk2b/", "price": "~$200"}
+      ],
+      "note": "Provides centimeter-level positioning for mobile triangulation. Requires RTK base station or NTRIP service for full accuracy.",
+      "setup": "Connect via USB (appears as COM port). Configure with u-center."
+    },
+    "eeg": {
+      "required": false,
+      "device": "TGAM EEG or OpenBCI",
+      "price": "$100-500",
+      "buy": [
+        {"name": "NeuroSky TGAM EEG Chip", "url": "https://store.neurosky.com/products/tgam", "price": "~$100"},
+        {"name": "OpenBCI Cyton 8-channel", "url": "https://shop.openbci.com/products/cyton-biosensing-board-8-channel", "price": "$499"},
+        {"name": "OpenBCI Ganglion 4-channel", "url": "https://shop.openbci.com/products/ganglion-board", "price": "$249"}
+      ],
+      "note": "Detects EEG extraction attacks and SSVEP stimulation. TGAM is bare chip (soldering required). OpenBCI is turnkey.",
+      "setup": "TGAM connects via Bluetooth COM port. OpenBCI has USB dongle. Requires electrodes."
+    },
+    "external_antennas": {
+      "required": false,
+      "device": "Directional Antennas",
+      "price": "$50-200",
+      "buy": [
+        {"name": "2.4 GHz Yagi Antenna", "url": "https://amazon.com", "price": "$30-50"},
+        {"name": "Log Periodic Antenna 400MHz-6GHz", "url": "https://amazon.com", "price": "$80-150"},
+        {"name": "DIY Ferrite Loop Antenna", "url": "N/A", "price": "$10-20"}
+      ],
+      "note": "Directional antennas dramatically improve bearing accuracy and range. Yagi for 2.4GHz MW detection. Log periodic for wideband. Ferrite loop for 450MHz DF."
+    }
+  },
+  "detects": [
+    "Everything from Tier 3, plus:",
+    "Ultrasound attacks (silent sound, eardrum capture, US modems)",
+    "Full ultrasonic spectrum to 384 kHz",
+    "EEG brain rhythm extraction (alpha/beta/gamma/delta/theta)",
+    "SSVEP stimulation detection",
+    "God Helmet magnetic stimulation",
+    "Nerve pain induction scanning",
+    "Centimeter-level source positioning (with GPS RTK)",
+    "Mobile triangulation (observer movement + GPS)",
+    "Sub-degree bearing with external antennas",
+    "Full forensic evidence chain with all sensor modalities"
+  ]
+}

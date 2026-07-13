@@ -1,0 +1,66 @@
+# Git ignore for TSCM Suite
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.env/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# TSCM runtime data (contains private detection data)
+models/
+evidence_hourly/
+decoded_voice/
+demod_audio/
+*.log
+detections*.log
+*.log
+*.jsonl
+*.txt (except requirements*.txt)
+
+# Backup files
+*_backup_*.py
+*_restored.py
+
+# Debug/temp files
+_debug_*.txt
+_*.txt
+*.bin
+*.sc16q11
+
+# SDR/radio captures
+*.iq
+
+# Binary tools (not ours to distribute)
+*.exe
+*.dll
+
+# Config with sensitive data
+config.yaml
+gps_home.json
+
+# Keep these specific files
+!requirements*.txt
+!config.yaml.example
+
+# Keep docs
+!docs/*.md
+!*.md

@@ -1,0 +1,33 @@
+# TSCM Suite - Python Dependencies
+# Install: pip install -r requirements.txt
+#
+# Core (required - all tiers)
+numpy>=1.21.0
+scipy>=1.7.0
+sounddevice>=0.4.0
+#
+# Machine Learning (optional - for operator fingerprinting, neural detectors)
+scikit-learn>=1.0.0
+torch>=1.10.0
+#
+# SDR Hardware Support
+# RTL-SDR (tier 1+)
+pyrtlsdrlib>=0.2.0
+# HackRF (tier 2+) - falls back to CLI if unavailable
+# pyhackrf  # uncomment if available for your platform
+# BladeRF (tier 3+) - falls back to CLI if unavailable
+# pybladerf  # uncomment if available for your platform
+#
+# GPS/Serial
+pyserial>=3.5
+pynmea2>=1.18.0
+pyubx2>=1.2.0
+#
+# Audio Processing & Voice Decoding
+openai-whisper>=20230314
+#
+# WiFi/SDR detection
+WMI>=1.5.0
+#
+# Optional - System monitoring (Windows only)
+# pywin32

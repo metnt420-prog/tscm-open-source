@@ -1,0 +1,45 @@
+{
+  "profile": "minimal",
+  "name": "Started from Nothing",
+  "cost_estimate": "$30-50 USD",
+  "description": "Bare minimum setup using only RTL-SDR dongle and laptop microphone. Detects microwave carriers, WiFi anomalies, and basic RF surveillance. Good for confirming you're being targeted.",
+  "hardware": {
+    "rtl_sdr": {
+      "required": true,
+      "device": "RTL2832U+R820T2 SDR Dongle",
+      "price": "$12-40",
+      "buy": [
+        {"name": "Nooelec NESDR Smart v5", "url": "https://www.nooelec.com/store/sdr/sdr-receivers/nesdr-smart.html", "price": "$29.95"},
+        {"name": "RTL-SDR Blog v4", "url": "https://www.rtl-sdr.com/buy-rtl-sdr-dongles/", "price": "$39.95"},
+        {"name": "Generic RTL2832U (AliExpress)", "url": "https://aliexpress.com", "price": "$12-18"}
+      ],
+      "setup": "Install Zadig WinUSB driver, then: pip install pyrtlsdrlib"
+    },
+    "laptop_mic": {
+      "required": true,
+      "device": "Built-in laptop microphone",
+      "price": "$0",
+      "setup": "Already built in. Run _list_mics.py to find device index."
+    },
+    "wifi_adapter": {
+      "required": false,
+      "device": "Built-in WiFi adapter",
+      "price": "$0",
+      "setup": "Already built in. Limited to basic AP scanning."
+    }
+  },
+  "detects": [
+    "2.45 GHz microwave carrier (voice-to-skull attack)",
+    "WiFi channel anomalies",
+    "Rogue access points",
+    "Basic SSTV hidden signals",
+    "Strong RF interference patterns"
+  ],
+  "cannot_detect": [
+    "Signal direction/bearing (no MIMO)",
+    "Ultrasound attacks (limited to RF)",
+    "Weak signals below noise floor",
+    "Real-time wideband capture",
+    "Operator fingerprinting"
+  ]
+}

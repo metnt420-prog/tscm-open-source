@@ -1,0 +1,75 @@
+{
+  "profile": "intermediate",
+  "name": "Getting Serious",
+  "cost_estimate": "$300-400 USD",
+  "description": "Adds HackRF One + SpyVerter upconverter + Alfa WiFi dongle. Unlocks full 1 MHz-6 GHz coverage, C2 network detection, and bearing estimation.",
+  "builds_on": "minimal",
+  "hardware": {
+    "rtl_sdr": {
+      "required": true,
+      "inherited_from": "minimal"
+    },
+    "hackrf_one": {
+      "required": true,
+      "device": "HackRF One",
+      "price": "$200-340",
+      "buy": [
+        {"name": "Great Scott Gadgets HackRF One", "url": "https://greatscottgadgets.com/hackrf/one/", "price": "$339"},
+        {"name": "Clone HackRF One (AliExpress)", "url": "https://aliexpress.com", "price": "$120-180"},
+        {"name": "OpenSourceSDR HackRF One (Amazon)", "url": "https://amazon.com", "price": "$180-250"}
+      ],
+      "setup": "Install hackrf tools, then: pip install pyhackrf (or use hackrf_usb.py fallback)"
+    },
+    "spyverter": {
+      "required": true,
+      "device": "SpyVerter Upconverter",
+      "price": "$49",
+      "buy": [
+        {"name": "AirSpy SpyVerter R2", "url": "https://airspy.com/spyverter/", "price": "$49"}
+      ],
+      "note": "Upconverts 1 kHz-60 MHz to 120 MHz for HackRF. Required for power line carrier detection.",
+      "setup": "Connect between antenna and HackRF. Enable bias tee for power."
+    },
+    "alfa_wifi": {
+      "required": true,
+      "device": "Alfa AWUS036ACH / AWUS036AX",
+      "price": "$25-60",
+      "buy": [
+        {"name": "Alfa AWUS036ACH (Dual-band AC1200)", "url": "https://amazon.com", "price": "$34.99"},
+        {"name": "Alfa AWUS036AX (WiFi 6 AX1800)", "url": "https://amazon.com", "price": "$59.99"},
+        {"name": "Panda PAU09 (N600)", "url": "https://amazon.com", "price": "$24.99"}
+      ],
+      "setup": "Plug in USB. Windows auto-installs drivers. Supports monitor mode + packet injection."
+    },
+    "laptop_mic": {
+      "required": true,
+      "inherited_from": "minimal"
+    },
+    "lna": {
+      "required": false,
+      "device": "Wideband LNA (Low Noise Amplifier)",
+      "price": "$25-50",
+      "buy": [
+        {"name": "Nooelec LaNA Wideband", "url": "https://www.nooelec.com/store/lana.html", "price": "$24.95"},
+        {"name": "LNA4ALL", "url": "https://lna4all.blogspot.com", "price": "$45"}
+      ],
+      "note": "Boosts weak signals before HackRF input. Dramatically improves range."
+    }
+  },
+  "detects": [
+    "Everything from Tier 1, plus:",
+    "Full 1 MHz - 6 GHz spectrum coverage",
+    "Bearing estimation via ferrite DF loop",
+    "Power line carrier communications",
+    "Hidden WiFi C2 networks with monitor mode",
+    "MAC spoofing detection",
+    "Ultrasound C2 modems (BPSK/FSK)",
+    "Injection locking attacks",
+    "SSTV activity with full decode"
+  ],
+  "cannot_detect": [
+    "Precise direction finding (need BladeRF MIMO for phase interferometry)",
+    "Passive radar body imaging",
+    "Sub-degree AoA bearings"
+  ]
+}

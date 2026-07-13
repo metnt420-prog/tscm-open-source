@@ -1,0 +1,192 @@
+# TSCM Suite Configuration
+# Copy this file to config.yaml and edit for your setup
+
+# ===== LOCATION =====
+# Set your fixed position (GPS disabled by default for security)
+home:
+  lat: 41.51325        # Your latitude
+  lon: -88.13368        # Your longitude
+
+# ===== HARDWARE =====
+sensors:
+  # BladeRF 2.0 xA9 MIMO (optional - tier 3+)
+  bladerf:
+    enabled: false
+    # If using bladerf-cli instead of Python bindings:
+    use_cli: false
+    cli_path: "bladeRF-cli"
+    # Frequency for RF monitoring
+    center_freq_hz: 2450000000  # 2.45 GHz for microwave voice detection
+    sample_rate_hz: 20000000
+    bandwidth_hz: 5000000
+    rx_channels: [0, 1]        # MIMO channels for AoA
+    gain_rx1: 50
+    gain_rx2: 50
+
+  # HackRF One (optional - tier 2+)
+  hackrf:
+    enabled: false
+    center_freq_hz: 450000000  # 450 MHz sweep
+    sample_rate_hz: 20000000
+    lna_gain: 32
+    vga_gain: 24
+    # Fixed position for dual-sensor triangulation
+    fixed_position:
+      lat: 41.5133
+      lon: -88.13368
+      offset_m: 5             # meters from home
+    # Ferrite DF loop bearing (default: 13 degrees)
+    ferrite_bearing_deg: 13
+
+  # RTL-SDR (tier 1 minimum)
+  rtlsdr:
+    enabled: true
+    center_freq_hz: 850000000
+    sample_rate_hz: 2400000
+    gain: 40
+    fixed_position:
+      lat: 41.51320
+      lon: -88.13368
+      offset_m: 5
+
+  # Petterson M500 Ultrasonic Detector (optional - tier 4)
+  petterson:
+    enabled: false
+    sample_rate_hz: 384000
+    device_index: 20
+
+  # Laptop Microphone Array
+  laptop_mic:
+    enabled: true
+    device_index: 0          # Change to your mic device index
+    sample_rate_hz: 48000
+    channels: 2              # 1=mono, 2=stereo, 4=array
+
+  # External USB Microphone (optional)
+  external_mic:
+    enabled: false
+    device_index: 1
+
+  # GPS (disabled by default - use fixed position)
+  gps:
+    enabled: false
+    port: null                # e.g., "COM5" on Windows, "/dev/ttyACM0" on Linux
+    baudrate: 115200
+
+  # WiFi Adapter for C2 Detection
+  wifi:
+    enabled: true
+    interface: null           # Auto-detect if null, or specify e.g. "Wi-Fi"
+
+  # EEG (optional - requires TGAM or OpenBCI)
+  eeg:
+    enabled: false
+    device: null              # "tgam" or "openbci"
+    port: null                # e.g., "COM7"
+
+# ===== DETECTORS =====
+detectors:
+  # RF Detectors (require at least RTL-SDR)
+  mw_voice_carrier: true      # 2.45 GHz microwave voice-to-skull carrier
+  mw_voice_decode: true       # Demodulate voice from microwave carrier
+  injection_locking: true     # Device synchronization attacks
+  power_line_carrier: true    # Power line communications
+  parametric_amplification: true
+  sstv_activity: true         # Slow-scan TV hidden signals
+  radar_passive: true         # Passive radar body detection
+  fingerprinter: true         # Operator identification
+
+  # WiFi Detectors
+  wifi_hidden_ap: true        # Hidden SSID networks
+  wifi_mac_spoof: true        # MAC address spoofing
+  wifi_channel_anomaly: true  # Rogue AP detection
+  wifi_c2_tracker: true       # C2 network tracking
+  stingray_detect: true       # IMSI catcher detection
+
+  # Acoustic/Ultrasound Detectors
+  silent_sound: true          # AM voice via ultrasound
+  ultrasound_carrier: true    # Constant US tones
+  eardrum_capture: true       # Remote eardrum vibration sensing
+  isolation_booth: true       # Acoustic isolation field
+  audio_aoa: true             # Acoustic direction finding
+
+  # Neurological Detectors
+  eeg_extraction: true        # EEG band monitoring
+  ssvep_detect: true          # Brain stimulation detection
+  god_helmet: true            # Magnetic temporal lobe stimulation
+  nerve_pain_scan: true       # Pain induction detection
+  forced_thought: true        # Thought induction detection
+
+  # C2/Network Detectors
+  c2_us_bpsk: true            # BPSK modem over ultrasound
+  c2_us_fsk: true             # FSK modem over ultrasound
+  c2_wifi_hidden: true        # Hidden WiFi C2
+  c2_server_connection: true  # C2 server connections
+  ecpri_injection: true       # Cellular baseband injection
+
+  # Operator Tracking
+  operator_fingerprint: true  # Unique operator identification
+  ghost_murmur: true          # Track operators after silence
+  ghost_hunter_snn: true      # Neural net operator detection
+
+# ===== AUDIO DECODING =====
+voice_decoder:
+  enabled: true
+  # Whisper model size: tiny, base, small, medium, large
+  whisper_model: "base"       # "base" is good balance of speed/accuracy
+  # Languages to detect (comma-separated, empty = auto-detect)
+  languages: "en"
+  # Output decoded audio to WAV files
+  save_wav: true
+  output_dir: "decoded_voice/wav"
+
+# ===== MAP SERVER =====
+map_server:
+  enabled: true
+  host: "127.0.0.1"          # localhost only for security
+  port: 8080
+  # Tile server (Leaflet-compatible)
+  tile_url: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+  # Refresh interval for detection updates (seconds)
+  refresh_interval: 2
+
+# ===== EVIDENCE & LOGGING =====
+evidence:
+  hourly_snapshots: true
+  snapshot_dir: "evidence_hourly"
+  persistent_sources: "models/persistent_sources.json"
+  operator_incidents: "models/operator_incidents.json"
+  voice_log: "models/decoded_voice_log.json"
+  wifi_intrusion_log: "models/wifi_intrusion_log.json"
+  # Maximum log file size before rotation (bytes)
+  max_log_size: 104857600  # 100 MB
+
+# ===== ALERTS =====
+alerts:
+  sms_enabled: false
+  sms_provider: null          # "twilio" or "email"
+  sms_number: null
+  email_alerts: false
+  email_to: null
+  # Alert on these threat levels
+  threat_levels: ["HACKING", "ATTACK", "C2"]
+
+# ===== SECURITY =====
+security:
+  # Restrict API to localhost
+  api_localhost_only: true
+  # Validate all input data
+  input_validation: true
+  # Max observation queue size per source
+  max_observations: 200
+  # Source persistence timeout (seconds of inactivity before archival)
+  source_timeout: 3600
+
+# ===== TRIANGULATION =====
+triangulation:
+  # Minimum observations for triangulation attempt
+  min_observations: 2
+  # Minimum distinct bearings for cross-sensor triangulation
+  min_bearings: 2
+  # Cross-sensor triangulation (BladeRF + HackRF)
+  cross_sensor: true
