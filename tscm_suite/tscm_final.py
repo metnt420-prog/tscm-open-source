@@ -7572,13 +7572,10 @@ class BearingHeatmapLogger:
 
 
 class SSTVDemodulator:
-    """Slow-Scan Television demodulator.
-    SSTV encodes images as audio tones: 1500Hz=black, 2300Hz=white.
-    Sync pulses at 1200Hz mark line boundaries.
-    Modes: Robot36 (~8s/frame), Scottie S1 (~30s), Martin M1 (~58s).
-    In the adversary system: video + voice channels combine via SSTV on a third channel.
-    This detector scans audio/RF data for SSTV sync patterns and demodulates frames."""
-    def __init__(self, output_dir=None):
+    """Slow-Scan Television demodulator with continuous audio accumulation.
+    Accumulates audio across cycles into a long buffer, then scans for
+    complete SSTV frames. MartinM1 needs ~30s of continuous audio for 256 lines."""
+    def __init__(self, output_dir=None, buffer_seconds=60):
         self.frames = deque(maxlen=30)
         self.sync_times = deque(maxlen=200)
         self.image_buffer = []
@@ -7586,106 +7583,153 @@ class SSTVDemodulator:
         self.sstv_dir = output_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sstv_captures')
         self.frame_count = 0
         self.sync_pulse_count = 0
-        self.modes = {
-            'Robot36': {'line_ms': 88, 'sync_ms': 7, 'pixel_ms': 78, 'lines': 256, 'cols': 320},
-            'Scottie1': {'line_ms': 60, 'sync_ms': 9, 'pixel_ms': 41, 'lines': 256, 'cols': 320},
-            'MartinM1': {'line_ms': 114, 'sync_ms': 5, 'pixel_ms': 107.5, 'lines': 256, 'cols': 320},
-        }
+        # Continuous audio ring buffer (60 seconds at 48kHz = ~2.88M samples)
+        self.sample_rate = 48000
+        self.buffer_seconds = buffer_seconds
+        self.max_samples = int(self.sample_rate * self.buffer_seconds)
+        self.audio_buffer = deque(maxlen=self.max_samples)
+        self.scan_offset = 0  # track how far we've scanned in the buffer
 
-    def detect_sync(self, audio_data, sample_rate):
-        """Detect SSTV sync pulses in audio data. Returns True and freq info if sync found."""
+    def feed(self, audio_data):
+        """Accumulate audio into ring buffer. Called every cycle."""
+        flat = np.asarray(audio_data).flatten()
+        # Fast extend: convert to list and extend
+        self.audio_buffer.extend(flat.tolist())
+
+    def scan_buffer(self):
+        """Scan accumulated buffer for complete SSTV frame. Returns frame info or None."""
         import numpy as np
-        if len(audio_data) < 1024:
-            return False, None
-        samples = np.array(audio_data, dtype=np.float64)
-        fft_size = min(2048, len(samples))
-        fft = np.abs(np.fft.rfft(samples[:fft_size]))
-        freqs = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
-        sync_bin = np.argmin(np.abs(freqs - 1200))
-        black_bin = np.argmin(np.abs(freqs - 1500))
-        white_bin = np.argmin(np.abs(freqs - 2300))
-        sync_amp = fft[sync_bin]
-        black_amp = fft[black_bin]
-        white_amp = fft[white_bin]
-        noise = np.median(fft)
-        sync_snr = 20 * np.log10((sync_amp + 1e-12) / (noise + 1e-12))
-        is_sync = sync_snr > 8 and sync_amp > black_amp * 0.8
-        if is_sync:
-            self.sync_pulse_count += 1
-            self.sync_times.append(time.time())
-        return is_sync, {
-            'sync_snr': sync_snr,
-            'sync_amp': float(sync_amp),
-            'black_amp': float(black_amp),
-            'white_amp': float(white_amp),
-            'noise_floor': float(noise)
-        }
-
-    def frequency_to_pixel(self, freq):
-        """Convert SSTV frequency to brightness: 1500Hz=black(0), 2300Hz=white(255)."""
-        brightness = (freq - 1500.0) / 800.0
-        return max(0, min(255, int(brightness * 255)))
-
-    def scan_for_sstv(self, audio_data, sample_rate):
-        """Full SSTV scan: detect sync, extract pixel frequencies, accumulate lines."""
-        import numpy as np
-        is_sync, info = self.detect_sync(audio_data, sample_rate)
-        if not is_sync:
+        audio = np.array(self.audio_buffer)
+        if len(audio) < self.sample_rate:  # need at least 1 second
             return None
-        # Determine mode from sync interval
-        if len(self.sync_times) >= 2:
-            interval = self.sync_times[-1] - self.sync_times[-2]
-            for mode, params in self.modes.items():
-                if abs(interval - params['line_ms'] / 1000.0) / (params['line_ms'] / 1000.0) < 0.3:
-                    self.current_mode = mode
-                    break
-        # Extract pixel data from frequency domain
-        samples = np.array(audio_data, dtype=np.float64)
-        pixel_rate = 960
-        samples_per_pixel = max(1, int(sample_rate / pixel_rate))
-        fft_size = min(2048, len(samples))
-        pixels = []
-        for i in range(0, min(len(samples) - fft_size, fft_size * 2), samples_per_pixel):
-            chunk = samples[i:i + fft_size]
-            if len(chunk) < 512:
-                break
-            chunk_fft = np.abs(np.fft.rfft(chunk * np.hanning(len(chunk))))
-            chunk_freqs = np.fft.rfftfreq(len(chunk), 1.0 / sample_rate)
-            mask = (chunk_freqs >= 1000) & (chunk_freqs <= 2500)
-            if not np.any(mask):
-                pixels.append(0)
-                continue
-            masked_fft = chunk_fft[mask]
-            masked_freqs = chunk_freqs[mask]
-            peak_freq = masked_freqs[np.argmax(masked_fft)]
-            pixels.append(self.frequency_to_pixel(peak_freq))
-        if len(pixels) > 100:
-            self.image_buffer.append(pixels)
-        # Check if frame complete
-        mode_params = self.modes.get(self.current_mode, self.modes['Robot36'])
-        if len(self.image_buffer) >= mode_params['lines']:
-            return self._assemble_frame(mode_params)
-        return None
+        return self._demodulate(audio, self.sample_rate)
 
-    def _assemble_frame(self, params):
-        """Assemble lines into image."""
+    def _demodulate(self, audio, sample_rate):
+        """Full SSTV demodulation from accumulated audio."""
+        import numpy as np
+        fft_size = 1024
+        hop = 256
+        n_frames = len(audio) // hop
+        if n_frames < 100:
+            return None
+
+        # Compute sync energy (1100-1300 Hz band)
+        sync_energy = np.zeros(n_frames)
+        for i in range(n_frames):
+            start = i * hop
+            chunk = audio[start:start + fft_size]
+            if len(chunk) < fft_size:
+                break
+            chunk_fft = np.abs(np.fft.rfft(chunk * np.hanning(fft_size)))
+            freqs = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
+            sync_mask = (freqs >= 1100) & (freqs <= 1300)
+            black_mask = (freqs >= 1400) & (freqs <= 1600)
+            s_e = np.sum(chunk_fft[sync_mask])
+            b_e = np.sum(chunk_fft[black_mask])
+            # Sync: 1200Hz dominant, 1500Hz suppressed
+            sync_energy[i] = s_e if s_e > b_e * 1.1 else 0
+
+        threshold = np.median(sync_energy[sync_energy > 0] + [1]) * 3 if np.any(sync_energy > 0) else 100
+        if threshold < 10:
+            threshold = np.median(sync_energy) * 4
+        above = sync_energy > threshold
+
+        # Find sync pulse starts
+        sync_starts = []
+        in_sync = False
+        for i, val in enumerate(above):
+            if val and not in_sync:
+                sync_starts.append(i)
+                in_sync = True
+            elif not val:
+                in_sync = False
+
+        if len(sync_starts) < 10:
+            # Update counters even without frame
+            self.sync_pulse_count += len(sync_starts)
+            for s in sync_starts:
+                self.sync_times.append(time.time() + s * hop / sample_rate)
+            return None
+
+        # Compute intervals and determine mode
+        intervals = [(sync_starts[i] - sync_starts[i-1]) * hop / sample_rate * 1000
+                      for i in range(1, len(sync_starts))]
+        median_int = np.median(intervals)
+
+        mode = 'Unknown'
+        line_ms = median_int
+        target_lines = 256
+        if 75 < median_int < 100:
+            mode = 'Robot36'; line_ms = 88
+        elif 50 < median_int < 70:
+            mode = 'Scottie1'; line_ms = 60
+        elif 100 < median_int < 130:
+            mode = 'MartinM1'; line_ms = 114
+
+        # Update sync counters
+        self.sync_pulse_count = len(sync_starts)
+        for s in sync_starts:
+            self.sync_times.append(time.time() + s * hop / sample_rate)
+
+        # Extract pixel lines between sync pulses
+        lines = []
+        for j in range(len(sync_starts) - 1):
+            line_start = sync_starts[j] * hop + int(5e-3 * sample_rate)  # skip sync+blank
+            line_end = sync_starts[j+1] * hop - int(1e-3 * sample_rate)
+            if line_end <= line_start:
+                continue
+            line_audio = audio[line_start:line_end]
+            if len(line_audio) < fft_size:
+                continue
+
+            pixels = []
+            pixel_hop = max(1, len(line_audio) // 320)
+            for k in range(0, len(line_audio) - fft_size, pixel_hop):
+                chunk = line_audio[k:k + fft_size]
+                chunk_fft = np.abs(np.fft.rfft(chunk * np.hanning(fft_size)))
+                chunk_freqs = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
+                sstv_mask = (chunk_freqs >= 1400) & (chunk_freqs <= 2500)
+                if not np.any(sstv_mask):
+                    pixels.append(128); continue
+                masked = chunk_fft[sstv_mask]
+                masked_freqs = chunk_freqs[sstv_mask]
+                peak_freq = masked_freqs[np.argmax(masked)]
+                brightness = (peak_freq - 1500.0) / 800.0
+                pixels.append(max(0, min(255, int(brightness * 255))))
+
+            if len(pixels) > 200:
+                lines.append(pixels)
+
+        if len(lines) < 50:
+            return None
+
+        # Assemble frame
+        target_cols = 320
+        frame_data = []
+        for line in lines[:target_lines]:
+            if len(line) >= target_cols:
+                frame_data.append(line[:target_cols])
+            else:
+                frame_data.append(line + [128] * (target_cols - len(line)))
+        while len(frame_data) < target_lines:
+            frame_data.append([0] * target_cols)
+
         try:
             from PIL import Image
-            lines = self.image_buffer[-params['lines']:]
-            cols = params['cols']
-            frame_data = [line[:cols] + [0] * max(0, cols - len(line)) for line in lines]
             arr = np.array(frame_data, dtype=np.uint8)
             img = Image.fromarray(arr, mode='L')
             self.frame_count += 1
-            path = os.path.join(self.sstv_dir, 'sstv_%06d_%s.png' % (self.frame_count, self.current_mode or 'unknown'))
             try:
                 os.makedirs(self.sstv_dir, exist_ok=True)
             except OSError:
                 pass
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            path = os.path.join(self.sstv_dir, 'sstv_%s_%s_%d.png' % (ts, mode.lower(), self.frame_count))
             img.save(path)
             self.frames.append(path)
             self.image_buffer = []
-            return {'path': path, 'mode': self.current_mode, 'lines': len(lines), 'frame': self.frame_count}
+            return {'path': path, 'mode': mode, 'lines': len(lines), 'frame': self.frame_count,
+                    'sync_count': len(sync_starts), 'median_interval': median_int}
         except ImportError:
             return None
 
@@ -7701,6 +7745,7 @@ class SSTVDemodulator:
             'frames_demodulated': self.frame_count,
             'detected_mode': self.current_mode,
             'lines_buffered': len(self.image_buffer),
+            'buffer_seconds': round(len(self.audio_buffer) / max(self.sample_rate, 1), 1),
             'output_dir': self.sstv_dir
         }
 
@@ -8707,14 +8752,11 @@ class TSCMSystem:
                     if h_freq < 30e6 and len(iq_hack) > 4096 and self.cycle_count % 5 == 0:
                         hackrf_audio = np.abs(iq_hack[:8192] - np.mean(iq_hack[:8192]))
                         hackrf_audio = hackrf_audio / (np.max(np.abs(hackrf_audio)) + 1e-12)
-                        sstv_hf = self.sstv.scan_for_sstv(hackrf_audio, Config.HACKRF_SAMPLE_RATE)
+                        # Feed HackRF AM audio to SSTV buffer
+                        self.sstv.feed(hackrf_audio)
+                        sstv_hf = self.sstv.scan_buffer()
                         if sstv_hf:
                             self.log.warning(f'SSTV HF: mode={sstv_hf["mode"]} at {h_freq/1e6:.1f}MHz -> {sstv_hf["path"]}')
-                            self.localization.add_observation(
-                                fingerprint=f'sstv_{h_freq:.0f}'.encode(),
-                                obs_lat=lat, obs_lon=lon, bearing_deg=hackrf_bearing,
-                                range_m=None, freq=h_freq, classification='sstv',
-                                detector_name='sstv_hf', snr=20)
                 except: pass
 
                 # FERRITE LOOP DIRECTION: per-frequency analysis
@@ -8992,13 +9034,17 @@ class TSCMSystem:
             if len(lpt_chunk)>100:
                 self.detectors['ai_voice'].update(lpt_chunk)
                 self.detectors['sstv'].update(lpt_chunk)
-                # SSTV frame demodulation: scan for sync + extract pixel data
-                if self.cycle_count % 3 == 0 and len(lpt_chunk) > 2400:
+                # SSTV: feed audio to ring buffer, scan for complete frames
+                if len(lpt_chunk) > 2400:
                     try:
-                        sstv_result = self.sstv.scan_for_sstv(lpt_chunk, 48000)
-                        if sstv_result:
-                            self.log.warning(f'SSTV FRAME: mode={sstv_result["mode"]} lines={sstv_result["lines"]} -> {sstv_result["path"]}')
-                    except: pass
+                        self.sstv.feed(lpt_chunk)
+                        if self.cycle_count % 10 == 0:
+                            sstv_result = self.sstv.scan_buffer()
+                            if sstv_result:
+                                self.log.warning(f'SSTV FRAME: mode={sstv_result["mode"]} lines={sstv_result["lines"]} syncs={sstv_result["sync_count"]} -> {sstv_result["path"]}')
+                    except Exception as e:
+                        if self.cycle_count % 50 == 0:
+                            self.log.error(f'SSTV feed error: {e}')
                 self.detectors['isolation_booth'].update(lpt_chunk)
                 self.detectors['silent_sound'].update(lpt_chunk)
                 self.detectors['eardrum'].update_room(lpt_chunk)
@@ -9444,14 +9490,11 @@ class TSCMSystem:
                 try:
                     rf_audio = np.abs(iq1[:4096] - np.mean(iq1[:4096]))  # AM envelope
                     rf_audio = rf_audio / (np.max(np.abs(rf_audio)) + 1e-12)
-                    sstv_rf = self.sstv.scan_for_sstv(rf_audio, Config.BLADERF_SAMPLE_RATE)
-                    if sstv_rf:
-                        self.log.warning(f'SSTV RF FRAME: mode={sstv_rf["mode"]} lines={sstv_rf["lines"]} -> {sstv_rf["path"]}')
-                    elif self.sstv.sync_pulse_count > 0:
-                        # Report sync rate even without full frame
-                        st = self.sstv.get_status()
-                        if st['sync_rate_hz'] > 0.5:
-                            self.log.info(f'SSTV RF: {st["sync_pulse_count"]} pulses {st["sync_rate_hz"]:.1f}Hz rate {st["lines_buffered"]} lines buffered')
+                    self.sstv.feed(rf_audio)
+                    if self.cycle_count % 10 == 0:
+                        sstv_rf = self.sstv.scan_buffer()
+                        if sstv_rf:
+                            self.log.warning(f'SSTV RF FRAME: mode={sstv_rf["mode"]} lines={sstv_rf["lines"]} -> {sstv_rf["path"]}')
                 except: pass
             # FULL-SPECTRUM OPEN SCAN: detect ANY coherent carrier 0-192kHz
             # No fixed bands - attacker changes frequencies. Find peaks anywhere.
