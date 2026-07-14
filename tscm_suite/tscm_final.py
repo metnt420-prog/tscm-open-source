@@ -6415,6 +6415,130 @@ class SignalActivityTracker:
         return sorted(results, key=lambda x: x['std_snr'], reverse=True)
 
 
+class TemporalPatternDetector:
+    """Detect cyclical transmission patterns indicating automated C2 polling.
+    Surveillance devices often transmit on fixed intervals (every 30s, 60s, 300s).
+    Detects periodicity in detection timestamps using autocorrelation."""
+    def __init__(self, min_period_s=10, max_period_s=600):
+        self.detection_times = {}  # fingerprint_key -> [timestamps]
+        self.min_period = min_period_s
+        self.max_period = max_period_s
+
+    def record(self, fingerprint_key, timestamp=None):
+        import time as _t
+        if timestamp is None:
+            timestamp = _t.time()
+        if isinstance(fingerprint_key, bytes):
+            fingerprint_key = fingerprint_key.decode('utf-8', errors='replace')
+        if fingerprint_key not in self.detection_times:
+            self.detection_times[fingerprint_key] = []
+        self.detection_times[fingerprint_key].append(timestamp)
+        # Keep last 100 detections per source
+        if len(self.detection_times[fingerprint_key]) > 100:
+            self.detection_times[fingerprint_key] = self.detection_times[fingerprint_key][-100:]
+
+    def detect_patterns(self):
+        """Scan all tracked sources for periodic patterns."""
+        import numpy as np
+        results = []
+        stale_keys = []
+        import time as _t
+        now = _t.time()
+        for key, times in self.detection_times.items():
+            if len(times) < 8:  # Need enough samples
+                continue
+            if times[-1] < now - 120:  # Stale data
+                stale_keys.append(key)
+                continue
+            intervals = np.diff(times)
+            # Filter out very short intervals (< min_period)
+            valid = intervals[intervals >= self.min_period]
+            if len(valid) < 4:
+                continue
+            mean_interval = np.mean(valid)
+            std_interval = np.std(valid)
+            # Coefficient of variation - low = very periodic
+            cv = std_interval / (mean_interval + 1e-12)
+            if mean_interval < self.min_period or mean_interval > self.max_period:
+                continue
+            if cv < 0.3:  # Regular period within 30% variance
+                results.append({
+                    'source': key,
+                    'period_s': float(mean_interval),
+                    'std_s': float(std_interval),
+                    'cv': float(cv),
+                    'samples': len(times),
+                    'classification': 'automated_c2' if cv < 0.15 else 'periodic_transmission'
+                })
+        for k in stale_keys:
+            self.detection_times.pop(k, None)
+        return sorted(results, key=lambda x: x['cv'])
+
+
+class SpectralCorrelator:
+    """Correlate detections across frequency bands to identify multi-band devices.
+    A single surveillance platform often emits across multiple bands simultaneously
+    (e.g., 2.4GHz C2 + 5.8GHz video + VHF telemetry)."""
+    def __init__(self, correlation_window_s=10):
+        self.band_events = {}  # band_key -> [timestamp, source_id]
+        self.window = correlation_window_s
+        self.correlations = []  # [(band_a, band_b, count, last_seen)]
+
+    def record(self, freq, source_id, timestamp=None):
+        import time as _t
+        if timestamp is None:
+            timestamp = _t.time()
+        # Bucket frequency into broad bands
+        if freq < 30e6:
+            band = 'VLF/HF'
+        elif freq < 300e6:
+            band = 'VHF'
+        elif freq < 1e9:
+            band = 'UHF'
+        elif freq < 3e9:
+            band = 'S-band'
+        elif freq < 6e9:
+            band = 'C-band'
+        else:
+            band = 'X-band'
+        if band not in self.band_events:
+            self.band_events[band] = []
+        self.band_events[band].append((timestamp, source_id))
+        cutoff = timestamp - self.window
+        while self.band_events[band] and self.band_events[band][0][0] < cutoff:
+            self.band_events[band].pop(0)
+
+    def get_correlations(self):
+        """Find pairs of bands with simultaneous detections -> likely same device."""
+        import time as _t
+        now = _t.time()
+        bands = list(self.band_events.keys())
+        results = []
+        for i, band_a in enumerate(bands):
+            for band_b in bands[i+1:]:
+                events_a = self.band_events.get(band_a, [])
+                events_b = self.band_events.get(band_b, [])
+                if not events_a or not events_b:
+                    continue
+                co_occurrences = 0
+                last_co = 0
+                for ta, sa in events_a:
+                    for tb, sb in events_b:
+                        if abs(ta - tb) < 2.0:  # Within 2 seconds
+                            co_occurrences += 1
+                            last_co = max(last_co, ta)
+                            break
+                if co_occurrences >= 3:
+                    results.append({
+                        'band_a': band_a,
+                        'band_b': band_b,
+                        'co_occurrences': co_occurrences,
+                        'last_seen': last_co,
+                        'classification': 'multi_band_platform'
+                    })
+        return results
+
+
 class FreqSweep:
     def __init__(self):
         self.hbands=HACKRF_SWEEP;self.bbands=BLADERF_SWEEP
@@ -6507,6 +6631,8 @@ class TSCMSystem:
         self.power_line_detector = PowerLineHarmonicDetector(fs=Config.HACKRF_SAMPLE_RATE)
         self.doppler_detector = DopplerShiftDetector(window_s=60, min_shift_hz=30)
         self.activity_tracker = SignalActivityTracker(window_s=300)
+        self.temporal_detector = TemporalPatternDetector(min_period_s=10, max_period_s=600)
+        self.spectral_correlator = SpectralCorrelator(correlation_window_s=15)
         # Stingray/IMSI catcher detector for 815-690-6926
         self.stingray = StingrayDetector(self.log, target_number="8156906926")
         # Local WiFi geolocation using RSSI + GPS position history
@@ -6927,6 +7053,11 @@ class TSCMSystem:
             bearing=bearing, snr=snr, range_m=range_m, method=source_type,
             raw_data={'aoa_source': self.aoa_source, 'det_freq': freq,
                       'det_snr': snr, 'obs_lat': obs_lat, 'obs_lon': obs_lon})
+        # Temporal pattern tracking + spectral correlation
+        try:
+            self.temporal_detector.record(fp or det_name)
+            self.spectral_correlator.record(freq, fp or det_name)
+        except: pass
 
         # Operator biometric tracking for fingerprinting detections
         if det_name == 'fingerprinting':
@@ -7254,6 +7385,14 @@ class TSCMSystem:
                         snap_path = os.path.join(snap_dir, f'snap_{time.strftime("%Y%m%d_%H%M%S")}.json')
                         with open(snap_path, 'w') as sf:
                             _json.dump(snapshot, sf, default=str, indent=2)
+                        # SHA256 hash for tamper verification
+                        import hashlib as _hl
+                        with open(snap_path, 'rb') as sf2:
+                            snap_hash = _hl.sha256(sf2.read()).hexdigest()
+                        hash_path = snap_path + '.sha256'
+                        with open(hash_path, 'w') as hf:
+                            hf.write(snap_hash + '  ' + os.path.basename(snap_path))
+                        self.log.info(f'EVIDENCE snapshot {os.path.basename(snap_path)} hash={snap_hash[:16]}')
                     except Exception as e:
                         self.log.debug(f'Snapshot save error: {e}')
                 # Feed ambient mapper with RF band power data
@@ -8484,6 +8623,22 @@ class TSCMSystem:
                     active_bands = self.activity_tracker.get_active_bands()
                     for ab in active_bands[:5]:
                         self.log.info(f'ACTIVITY: {ab["band_mhz"]:.0f}MHz std_snr={ab["std_snr"]:.1f} spikes={ab["spike_pct"]:.0f}% ({ab["classification"]})')
+                except: pass
+
+            # Temporal pattern detection (every 60 cycles)
+            if self.cycle_count % 60 == 0:
+                try:
+                    patterns = self.temporal_detector.detect_patterns()
+                    for pat in patterns[:5]:
+                        self.log.warning(f'TEMPORAL: {pat["source"][:40]} period={pat["period_s"]:.1f}s cv={pat["cv"]:.2f} ({pat["classification"]})')
+                except: pass
+
+            # Spectral correlation (every 60 cycles)
+            if self.cycle_count % 60 == 0:
+                try:
+                    correlations = self.spectral_correlator.get_correlations()
+                    for corr in correlations[:5]:
+                        self.log.warning(f'MULTI-BAND: {corr["band_a"]} + {corr["band_b"]} co-occur={corr["co_occurrences"]} ({corr["classification"]})')
                 except: pass
 
             # 10. WiFi AP scanning with LOCAL geolocation + CSI motion detection
