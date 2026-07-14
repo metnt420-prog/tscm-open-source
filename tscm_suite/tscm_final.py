@@ -7756,6 +7756,200 @@ class SSTVDemodulator:
         }
 
 
+class RFBurstDetector:
+    """Detects sudden RF signal bursts (transmitter key-ups, surveillance activation).
+    Tracks power per band over short windows. Flags when power jumps >4x std dev
+    within 2 seconds — indicates a device powering on or starting transmission.
+    Evidence value: burst timestamps + frequency + power delta = device activity timeline."""
+    def __init__(self):
+        self.band_power = {}  # {freq_range_str: deque of (time, power)}
+        self.bursts = deque(maxlen=100)
+        self.burst_log = deque(maxlen=500)
+        self.window = 20  # samples in rolling window
+        self.threshold_sigma = 4.0
+
+    def update(self, freq, power_db):
+        """Update power tracking for a frequency band. Call per sweep point."""
+        # Use coarse 10MHz bands for burst tracking (stable across sweep changes)
+        band_key = '%dMHz' % (int(freq / 10e6) * 10)
+        if band_key not in self.band_power:
+            self.band_power[band_key] = deque(maxlen=self.window)
+        now = time.time()
+        self.band_power[band_key].append((now, power_db))
+
+    def check_bursts(self):
+        """Check all bands for burst events. Returns list of burst dicts."""
+        new_bursts = []
+        now = time.time()
+        for band_key, samples in self.band_power.items():
+            if len(samples) < 5:
+                continue
+            times = [s[0] for s in samples]
+            powers = [s[1] for s in samples]
+            mean_p = np.mean(powers)
+            std_p = max(np.std(powers), 0.1)
+            # Check recent samples for burst
+            for j in range(max(0, len(samples)-5), len(samples)):
+                t, p = samples[j]
+                if p > mean_p + self.threshold_sigma * std_p and abs(p - mean_p) > 6:
+                    # Check if this burst was already recorded (same band within 10s)
+                    recent = [b for b in self.burst_log if b['band'] == band_key and now - b['time'] < 10]
+                    if not recent:
+                        burst = {
+                            'time': t, 'band': band_key,
+                            'power': p, 'baseline': mean_p,
+                            'delta_db': p - mean_p,
+                            'freq_center': np.mean([float(band_key.split('_')[0]), float(band_key.split('_')[1])])
+                        }
+                        self.bursts.append(burst)
+                        self.burst_log.append(burst)
+                        new_bursts.append(burst)
+                        break
+        return new_bursts
+
+    def get_status(self):
+        return {
+            'bands_tracked': len(self.band_power),
+            'total_bursts': len(self.burst_log),
+            'recent_bursts': len([b for b in self.burst_log if time.time() - b['time'] < 300])
+        }
+
+
+class SpectralWaterfallLogger:
+    """Saves periodic spectral waterfall snapshots for temporal analysis.
+    Creates timestamped power-vs-frequency arrays every N seconds.
+    Used for: detecting pattern changes, blind spot analysis, court evidence timeline."""
+    def __init__(self, output_dir=None, interval_seconds=60):
+        self.interval = interval_seconds
+        self.last_save = 0
+        self.snapshots = deque(maxlen=100)  # keep last 100 in memory
+        self.waterfall_dir = output_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'waterfall_snapshots')
+        try:
+            os.makedirs(self.waterfall_dir, exist_ok=True)
+        except OSError:
+            pass
+
+    def add_spectrum(self, freqs, powers, source='unknown'):
+        """Add a spectrum snapshot. Call with (freq_array, power_db_array)."""
+        now = time.time()
+        if now - self.last_save < self.interval:
+            return None
+        self.last_save = now
+        snapshot = {
+            'time': now,
+            'freqs': freqs.tolist() if hasattr(freqs, 'tolist') else list(freqs),
+            'powers': powers.tolist() if hasattr(powers, 'tolist') else list(powers),
+            'source': source,
+            'n_bins': len(freqs)
+        }
+        self.snapshots.append(snapshot)
+        # Save to disk
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(self.waterfall_dir, 'waterfall_%s_%s.npz' % (ts, source))
+        try:
+            np.savez_compressed(path, freqs=freqs, powers=powers, timestamp=now, source=source)
+        except:
+            pass
+        return snapshot
+
+    def get_anomaly(self):
+        """Compare latest snapshot against baseline. Returns anomaly score."""
+        if len(self.snapshots) < 5:
+            return {'anomaly': 0, 'changed_bands': 0}
+        latest = self.snapshots[-1]
+        baseline_powers = np.mean([s['powers'] for s in list(self.snapshots)[-6:-1]], axis=0)
+        latest_powers = np.array(latest['powers'])
+        diff = latest_powers - baseline_powers
+        changed = np.sum(np.abs(diff) > 6)  # >6dB change
+        anomaly = float(np.mean(np.abs(diff)))
+        return {'anomaly': round(anomaly, 2), 'changed_bands': int(changed),
+                'max_delta': round(float(np.max(np.abs(diff))), 1)}
+
+    def get_status(self):
+        return {
+            'snapshots_saved': len(self.snapshots),
+            'interval_s': self.interval,
+            'output_dir': self.waterfall_dir
+        }
+
+
+class WiFiClientTracker:
+    """Tracks device join/leave events on nearby WiFi APs.
+    Detects surveillance equipment by monitoring client connections.
+    Key indicator: unknown MACs joining mesh network APs, or devices hopping between APs."""
+    def __init__(self):
+        self.ap_clients = {}  # {bssid: {mac: last_seen_time}}
+        self.join_events = deque(maxlen=200)
+        self.leave_events = deque(maxlen=200)
+        self.unknown_ouis = deque(maxlen=100)  # OUIs not in known vendor list
+        self.hop_events = deque(maxlen=100)  # devices appearing on multiple APs
+        self._known_vendors = set()  # populated from first scan
+
+    def update(self, ap_list):
+        """Process AP scan results. ap_list: list of dicts with 'bssid', 'clients' keys.
+        Clients format: list of MAC addresses seen on each AP."""
+        now = time.time()
+        for ap in ap_list:
+            bssid = ap.get('bssid', '')
+            ssid = ap.get('ssid', '')
+            clients = ap.get('clients', [])
+            if bssid not in self.ap_clients:
+                self.ap_clients[bssid] = {}
+            # Detect new clients (join events)
+            current_macs = set()
+            for mac in clients:
+                mac_lower = mac.lower()
+                current_macs.add(mac_lower)
+                if mac_lower not in self.ap_clients[bssid]:
+                    self.join_events.append({
+                        'time': now, 'bssid': bssid, 'ssid': ssid,
+                        'client_mac': mac_lower,
+                        'oui': mac_lower[:8]
+                    })
+                    # Check if OUI is unknown
+                    oui = mac_lower[:8]
+                    if oui not in self._known_vendors:
+                        self.unknown_ouis.append({
+                            'time': now, 'oui': oui, 'mac': mac_lower,
+                            'ap': bssid, 'ssid': ssid
+                        })
+                    # Check if this MAC appeared on a different AP
+                    for other_bssid, other_clients in self.ap_clients.items():
+                        if other_bssid != bssid and mac_lower in other_clients:
+                            self.hop_events.append({
+                                'time': now, 'mac': mac_lower,
+                                'from_ap': other_bssid, 'to_ap': bssid
+                            })
+                self.ap_clients[bssid][mac_lower] = now
+            # Detect leave events (was in ap_clients but not in current scan)
+            stale = [m for m, t in self.ap_clients[bssid].items()
+                     if m not in current_macs and now - t > 60]
+            for mac in stale:
+                self.leave_events.append({
+                    'time': now, 'bssid': bssid, 'client_mac': mac
+                })
+                self.ap_clients[bssid].pop(mac, None)
+        # Build known vendor set
+        if not self._known_vendors:
+            for ap in ap_list:
+                bssid = ap.get('bssid', '')
+                self._known_vendors.add(bssid.lower()[:8])
+
+    def get_status(self):
+        recent_joins = [e for e in self.join_events if time.time() - e['time'] < 600]
+        total_clients = sum(len(clients) for clients in self.ap_clients.values())
+        suspicious = len([e for e in self.unknown_ouis if time.time() - e['time'] < 300])
+        hoppers = len([e for e in self.hop_events if time.time() - e['time'] < 600])
+        return {
+            'aps_monitored': len(self.ap_clients),
+            'total_clients': total_clients,
+            'recent_joins': len(recent_joins),
+            'unknown_oui_alerts': suspicious,
+            'ap_hop_events': hoppers
+        }
+
+
 class VideoVoiceCorrelator:
     """Correlates video and voice channels to detect SSTV composite signals.
     Monitors all three channels: video (C-band), voice (MW), and SSTV composite."""
@@ -8001,6 +8195,13 @@ class TSCMSystem:
         self.sstv = SSTVDemodulator()
         # Video+Voice+Channel correlator: track all three adversary channels
         self.vv_correlator = VideoVoiceCorrelator()
+        # RF burst detector: sudden signal appearances/disappearances
+        self._last_hackrf_spectrum = None
+        self.rf_burst = RFBurstDetector()
+        # Spectral waterfall logger: periodic snapshots for temporal analysis
+        self.waterfall = SpectralWaterfallLogger()
+        # WiFi client tracker: device join/leave surveillance detection
+        self.wifi_tracker = WiFiClientTracker()
         self.null_enabled = Config.ENABLE_NULL_STEERING
         if self.null_enabled:
             # TX bias tee: enable in the RX capture loop (same bladeRF session)
@@ -8829,6 +9030,8 @@ class TSCMSystem:
                             hackrf_f = np.fft.rfftfreq(n_fft, 1/Config.HACKRF_SAMPLE_RATE)
                             bladerf_fft = np.abs(np.fft.rfft(iq1[-n_fft:].astype(np.complex128)))
                             bladerf_f = np.fft.rfftfreq(n_fft, 1/Config.BLADERF_SAMPLE_RATE)
+                            # Save HackRF spectrum for waterfall logger
+                            self._last_hackrf_spectrum = (hackrf_f, 20*np.log10(hackrf_fft + 1e-12))
 
                             hackrf_noise = np.median(hackrf_fft) + 1e-12
                             bladerf_noise = np.median(bladerf_fft) + 1e-12
@@ -8911,6 +9114,7 @@ class TSCMSystem:
                     self.hackrf_range = hackrf_range  # store for downstream detector use
                     self.activity_tracker.update(h_rf_freq, 20*np.log10(hackrf_rms+1e-12), hackrf_rms*1000, now)
                     self.strength_delta.record(h_rf_freq, 20*np.log10(hackrf_rms+1e-12), now)
+                    self.rf_burst.update(h_rf_freq, 20*np.log10(hackrf_rms+1e-12))
                     if hackrf_rms > 0.001:
                         self.localization.add_observation(
                             fingerprint='hackrf_ferrite',
@@ -9954,7 +10158,24 @@ class TSCMSystem:
             sources=self.localization.resolve_sources(lat,lon)
             self.last_sources=sources
 
+            # 9a. RF burst detection
+            try:
+                new_bursts = self.rf_burst.check_bursts()
+                if new_bursts:
+                    for b in new_bursts[:3]:
+                        self.log.warning(f'RF BURST: {b["delta_db"]:+.0f}dB at {b["freq_center"]/1e6:.1f}MHz')
+            except: pass
+
             # 9a. Threat scoring - score all sources
+
+            # Spectral waterfall snapshot (every 5 cycles)
+            if self.cycle_count % 5 == 0:
+                try:
+                    if hasattr(self, '_last_hackrf_spectrum') and self._last_hackrf_spectrum is not None:
+                        freqs, powers = self._last_hackrf_spectrum
+                        self.waterfall.add_spectrum(freqs, powers, source='hackrf')
+                except: pass
+
             try:
                 threat_counts = self.threat_engine.get_threat_summary()
                 for src in sources:
@@ -10216,6 +10437,8 @@ class TSCMSystem:
                     self.detectors['wifi_approaching'].update(aps)
                     # WiFi video surveillance: find strong/hidden APs that could relay video
                     self.wifi_video.update(aps)
+                                        # WiFi client tracking: detect surveillance devices joining APs
+                    self.wifi_tracker.update(aps)
                     # Mesh network detection
                     self.mesh_detector.update(aps)
                     # CSI analysis: motion/presence/jamming
@@ -10815,6 +11038,9 @@ class TSCMSystem:
                 'hot_bearings':self.bearing_heatmap.get_hot_bearings(10),
                 'sstv_status':self.sstv.get_status(),
                 'vv_channels':self.vv_correlator.get_report(),
+                'rf_bursts':self.rf_burst.get_status(),
+                'waterfall':self.waterfall.get_status(),
+                'wifi_clients':self.wifi_tracker.get_status(),
                 'watcher_findings': [{'type': f.get('type','?'), 'info': f.get('info','')[:100]}
                                 for f in list(self.watcher.findings)[-5:]],
                 'wifi_aps':wigle_aps,
