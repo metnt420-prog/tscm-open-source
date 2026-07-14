@@ -1,3 +1,12 @@
+
+
+![GitHub stars](https://img.shields.io/github/stars/metnt420-prog/tscm-open-source?style=social)
+![GitHub forks](https://img.shields.io/github/forks/metnt420-prog/tscm-open-source?style=social)
+![GitHub issues](https://img.shields.io/github/issues/metnt420-prog/tscm-open-source)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
+
+> **If you are a targeted individual experiencing electronic harassment, this tool can help you document and prove it.** See [KNOWN_VICTIMS.md](KNOWN_VICTIMS.md) and [WHITE_PAPER.md](WHITE_PAPER.md).
 # 🛡️ TSCM Open Source — Technical Surveillance Counter-Measures Suite
 
 > ⚠️ **HELP WANTED** — We need GPU developers, signal processing engineers, legal researchers, and fellow victims.
