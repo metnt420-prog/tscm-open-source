@@ -7571,6 +7571,180 @@ class BearingHeatmapLogger:
         return segments
 
 
+class SSTVDemodulator:
+    """Slow-Scan Television demodulator.
+    SSTV encodes images as audio tones: 1500Hz=black, 2300Hz=white.
+    Sync pulses at 1200Hz mark line boundaries.
+    Modes: Robot36 (~8s/frame), Scottie S1 (~30s), Martin M1 (~58s).
+    In the adversary system: video + voice channels combine via SSTV on a third channel.
+    This detector scans audio/RF data for SSTV sync patterns and demodulates frames."""
+    def __init__(self, output_dir=None):
+        self.frames = deque(maxlen=30)
+        self.sync_times = deque(maxlen=200)
+        self.image_buffer = []
+        self.current_mode = None
+        self.sstv_dir = output_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sstv_captures')
+        self.frame_count = 0
+        self.sync_pulse_count = 0
+        self.modes = {
+            'Robot36': {'line_ms': 88, 'sync_ms': 7, 'pixel_ms': 78, 'lines': 256, 'cols': 320},
+            'Scottie1': {'line_ms': 60, 'sync_ms': 9, 'pixel_ms': 41, 'lines': 256, 'cols': 320},
+            'MartinM1': {'line_ms': 114, 'sync_ms': 5, 'pixel_ms': 107.5, 'lines': 256, 'cols': 320},
+        }
+
+    def detect_sync(self, audio_data, sample_rate):
+        """Detect SSTV sync pulses in audio data. Returns True and freq info if sync found."""
+        import numpy as np
+        if len(audio_data) < 1024:
+            return False, None
+        samples = np.array(audio_data, dtype=np.float64)
+        fft_size = min(2048, len(samples))
+        fft = np.abs(np.fft.rfft(samples[:fft_size]))
+        freqs = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
+        sync_bin = np.argmin(np.abs(freqs - 1200))
+        black_bin = np.argmin(np.abs(freqs - 1500))
+        white_bin = np.argmin(np.abs(freqs - 2300))
+        sync_amp = fft[sync_bin]
+        black_amp = fft[black_bin]
+        white_amp = fft[white_bin]
+        noise = np.median(fft)
+        sync_snr = 20 * np.log10((sync_amp + 1e-12) / (noise + 1e-12))
+        is_sync = sync_snr > 8 and sync_amp > black_amp * 0.8
+        if is_sync:
+            self.sync_pulse_count += 1
+            self.sync_times.append(time.time())
+        return is_sync, {
+            'sync_snr': sync_snr,
+            'sync_amp': float(sync_amp),
+            'black_amp': float(black_amp),
+            'white_amp': float(white_amp),
+            'noise_floor': float(noise)
+        }
+
+    def frequency_to_pixel(self, freq):
+        """Convert SSTV frequency to brightness: 1500Hz=black(0), 2300Hz=white(255)."""
+        brightness = (freq - 1500.0) / 800.0
+        return max(0, min(255, int(brightness * 255)))
+
+    def scan_for_sstv(self, audio_data, sample_rate):
+        """Full SSTV scan: detect sync, extract pixel frequencies, accumulate lines."""
+        import numpy as np
+        is_sync, info = self.detect_sync(audio_data, sample_rate)
+        if not is_sync:
+            return None
+        # Determine mode from sync interval
+        if len(self.sync_times) >= 2:
+            interval = self.sync_times[-1] - self.sync_times[-2]
+            for mode, params in self.modes.items():
+                if abs(interval - params['line_ms'] / 1000.0) / (params['line_ms'] / 1000.0) < 0.3:
+                    self.current_mode = mode
+                    break
+        # Extract pixel data from frequency domain
+        samples = np.array(audio_data, dtype=np.float64)
+        pixel_rate = 960
+        samples_per_pixel = max(1, int(sample_rate / pixel_rate))
+        fft_size = min(2048, len(samples))
+        pixels = []
+        for i in range(0, min(len(samples) - fft_size, fft_size * 2), samples_per_pixel):
+            chunk = samples[i:i + fft_size]
+            if len(chunk) < 512:
+                break
+            chunk_fft = np.abs(np.fft.rfft(chunk * np.hanning(len(chunk))))
+            chunk_freqs = np.fft.rfftfreq(len(chunk), 1.0 / sample_rate)
+            mask = (chunk_freqs >= 1000) & (chunk_freqs <= 2500)
+            if not np.any(mask):
+                pixels.append(0)
+                continue
+            masked_fft = chunk_fft[mask]
+            masked_freqs = chunk_freqs[mask]
+            peak_freq = masked_freqs[np.argmax(masked_fft)]
+            pixels.append(self.frequency_to_pixel(peak_freq))
+        if len(pixels) > 100:
+            self.image_buffer.append(pixels)
+        # Check if frame complete
+        mode_params = self.modes.get(self.current_mode, self.modes['Robot36'])
+        if len(self.image_buffer) >= mode_params['lines']:
+            return self._assemble_frame(mode_params)
+        return None
+
+    def _assemble_frame(self, params):
+        """Assemble lines into image."""
+        try:
+            from PIL import Image
+            lines = self.image_buffer[-params['lines']:]
+            cols = params['cols']
+            frame_data = [line[:cols] + [0] * max(0, cols - len(line)) for line in lines]
+            arr = np.array(frame_data, dtype=np.uint8)
+            img = Image.fromarray(arr, mode='L')
+            self.frame_count += 1
+            path = os.path.join(self.sstv_dir, 'sstv_%06d_%s.png' % (self.frame_count, self.current_mode or 'unknown'))
+            try:
+                os.makedirs(self.sstv_dir, exist_ok=True)
+            except OSError:
+                pass
+            img.save(path)
+            self.frames.append(path)
+            self.image_buffer = []
+            return {'path': path, 'mode': self.current_mode, 'lines': len(lines), 'frame': self.frame_count}
+        except ImportError:
+            return None
+
+    def get_status(self):
+        sync_rate = 0
+        if len(self.sync_times) >= 2:
+            dt = self.sync_times[-1] - self.sync_times[0]
+            if dt > 0:
+                sync_rate = (len(self.sync_times) - 1) / dt
+        return {
+            'sync_pulses': self.sync_pulse_count,
+            'sync_rate_hz': round(sync_rate, 2),
+            'frames_demodulated': self.frame_count,
+            'detected_mode': self.current_mode,
+            'lines_buffered': len(self.image_buffer),
+            'output_dir': self.sstv_dir
+        }
+
+
+class VideoVoiceCorrelator:
+    """Correlates video and voice channels to detect SSTV composite signals.
+    Monitors all three channels: video (C-band), voice (MW), and SSTV composite."""
+    def __init__(self):
+        self.channels = {
+            'voice': {'active': False, 'freq': None, 'snr': 0, 'bearing': None, 'last_seen': 0},
+            'video': {'active': False, 'freq': None, 'snr': 0, 'bearing': None, 'last_seen': 0},
+            'sstv': {'active': False, 'freq': None, 'snr': 0, 'bearing': None, 'last_seen': 0}
+        }
+
+    def update(self, sources):
+        now = time.time()
+        for src in sources:
+            freq = src.get('freq', 0)
+            cls = str(src.get('classification', '')).lower()
+            det = str(src.get('detector', '')).lower()
+            snr = src.get('snr', 0)
+            bearing = src.get('bearing')
+            if 'voice' in det or 'voice' in cls or 'mw' in det:
+                self.channels['voice'] = {'active': True, 'freq': freq, 'snr': snr, 'bearing': bearing, 'last_seen': now}
+            if any(k in cls for k in ['video', 'drone', 'relay', 'sstv']) or (freq > 5e9 and snr > 10):
+                self.channels['video'] = {'active': True, 'freq': freq, 'snr': snr, 'bearing': bearing, 'last_seen': now}
+            if 'silent_sound' in det or 'subaudible' in cls or 'sstv' in det:
+                self.channels['sstv'] = {'active': True, 'freq': freq, 'snr': snr, 'bearing': bearing, 'last_seen': now}
+        for ch in self.channels.values():
+            if now - ch['last_seen'] > 120:
+                ch['active'] = False
+
+    def get_report(self):
+        return {
+            'voice_active': self.channels['voice']['active'],
+            'video_active': self.channels['video']['active'],
+            'sstv_active': self.channels['sstv']['active'],
+            'voice_freq': self.channels['voice']['freq'],
+            'video_freq': self.channels['video']['freq'],
+            'sstv_freq': self.channels['sstv']['freq'],
+            'active_count': sum(1 for c in self.channels.values() if c['active'])
+        }
+
+
 class FreqSweep:
     def __init__(self):
         self.hbands=HACKRF_SWEEP;self.bbands=BLADERF_SWEEP
@@ -7772,6 +7946,10 @@ class TSCMSystem:
         self.sigint = SignalIntelligenceAnalyzer()
         # Bearing heatmap: persist bearing observations across restarts
         self.bearing_heatmap = BearingHeatmapLogger()
+        # SSTV demodulator: detect and decode slow-scan television from audio/RF
+        self.sstv = SSTVDemodulator()
+        # Video+Voice+Channel correlator: track all three adversary channels
+        self.vv_correlator = VideoVoiceCorrelator()
         self.null_enabled = Config.ENABLE_NULL_STEERING
         if self.null_enabled:
             # TX bias tee: enable in the RX capture loop (same bladeRF session)
@@ -8524,6 +8702,21 @@ class TSCMSystem:
                 hackrf_bearing = None
                 hackrf_bearing_confidence = 0.0
 
+                # SSTV scan on HackRF VLF/HF data (traditional SSTV bands 3-30 MHz)
+                try:
+                    if h_freq < 30e6 and len(iq_hack) > 4096 and self.cycle_count % 5 == 0:
+                        hackrf_audio = np.abs(iq_hack[:8192] - np.mean(iq_hack[:8192]))
+                        hackrf_audio = hackrf_audio / (np.max(np.abs(hackrf_audio)) + 1e-12)
+                        sstv_hf = self.sstv.scan_for_sstv(hackrf_audio, Config.HACKRF_SAMPLE_RATE)
+                        if sstv_hf:
+                            self.log.warning(f'SSTV HF: mode={sstv_hf["mode"]} at {h_freq/1e6:.1f}MHz -> {sstv_hf["path"]}')
+                            self.localization.add_observation(
+                                fingerprint=f'sstv_{h_freq:.0f}'.encode(),
+                                obs_lat=lat, obs_lon=lon, bearing_deg=hackrf_bearing,
+                                range_m=None, freq=h_freq, classification='sstv',
+                                detector_name='sstv_hf', snr=20)
+                except: pass
+
                 # FERRITE LOOP DIRECTION: per-frequency analysis
                 # Different frequencies come from different directions
                 # The ferrite loop's figure-8 pattern tells us:
@@ -8799,6 +8992,13 @@ class TSCMSystem:
             if len(lpt_chunk)>100:
                 self.detectors['ai_voice'].update(lpt_chunk)
                 self.detectors['sstv'].update(lpt_chunk)
+                # SSTV frame demodulation: scan for sync + extract pixel data
+                if self.cycle_count % 3 == 0 and len(lpt_chunk) > 2400:
+                    try:
+                        sstv_result = self.sstv.scan_for_sstv(lpt_chunk, 48000)
+                        if sstv_result:
+                            self.log.warning(f'SSTV FRAME: mode={sstv_result["mode"]} lines={sstv_result["lines"]} -> {sstv_result["path"]}')
+                    except: pass
                 self.detectors['isolation_booth'].update(lpt_chunk)
                 self.detectors['silent_sound'].update(lpt_chunk)
                 self.detectors['eardrum'].update_room(lpt_chunk)
@@ -9238,6 +9438,20 @@ class TSCMSystem:
                                     range_m=dist_km*1000, freq=0,
                                     classification='transmitter',
                                     detector_name='oth_radar', snr=float(pk/base))
+                except: pass
+            # SSTV on BladeRF RF carrier: AM-demodulate S-band IQ and scan for SSTV sync
+            if self.cycle_count % 5 == 0 and iq1 is not None and len(iq1) > 2048:
+                try:
+                    rf_audio = np.abs(iq1[:4096] - np.mean(iq1[:4096]))  # AM envelope
+                    rf_audio = rf_audio / (np.max(np.abs(rf_audio)) + 1e-12)
+                    sstv_rf = self.sstv.scan_for_sstv(rf_audio, Config.BLADERF_SAMPLE_RATE)
+                    if sstv_rf:
+                        self.log.warning(f'SSTV RF FRAME: mode={sstv_rf["mode"]} lines={sstv_rf["lines"]} -> {sstv_rf["path"]}')
+                    elif self.sstv.sync_pulse_count > 0:
+                        # Report sync rate even without full frame
+                        st = self.sstv.get_status()
+                        if st['sync_rate_hz'] > 0.5:
+                            self.log.info(f'SSTV RF: {st["sync_pulse_count"]} pulses {st["sync_rate_hz"]:.1f}Hz rate {st["lines_buffered"]} lines buffered')
                 except: pass
             # FULL-SPECTRUM OPEN SCAN: detect ANY coherent carrier 0-192kHz
             # No fixed bands - attacker changes frequencies. Find peaks anywhere.
@@ -9712,6 +9926,13 @@ class TSCMSystem:
             # Signal intelligence: update adversary attack profile
             try:
                 self.sigint.update(sources, self.cycle_count)
+                # Video+Voice+Channel correlator
+                self.vv_correlator.update(sources)
+                # Run existing SSTV detector
+                sstv_dets = self.detectors.get('sstv')
+                if sstv_dets and hasattr(sstv_dets, 'detect'):
+                    for sd in sstv_dets.detect():
+                        self.log.info(f'SSTV ACTIVITY: {sd.get("times_runs",0)} sync runs')
                 if self.cycle_count % 30 == 0:
                     profile = self.sigint.get_profile()
                     active = profile['active_techniques']
@@ -10496,6 +10717,8 @@ class TSCMSystem:
                 'attack_profile':self.sigint.get_profile(),
                 'bearing_heatmap':self.bearing_heatmap.get_heatmap_data(),
                 'hot_bearings':self.bearing_heatmap.get_hot_bearings(10),
+                'sstv_status':self.sstv.get_status(),
+                'vv_channels':self.vv_correlator.get_report(),
                 'watcher_findings': [{'type': f.get('type','?'), 'info': f.get('info','')[:100]}
                                 for f in list(self.watcher.findings)[-5:]],
                 'wifi_aps':wigle_aps,
@@ -10569,6 +10792,7 @@ class TSCMSystem:
                   f"Video:{self.video_demod.frame_count}fr | "
                   f"Mesh:{len(self.mesh_detector.mesh_clusters)} | "
                   f"Sigint:{sum(1 for v in self.sigint.attack_profile.values() if v)}/{len(self.sigint.attack_profile)} | "
+                  f"SSTV:{self.sstv.sync_pulse_count}sync/{self.sstv.frame_count}fr | "
                   f"Intent:{intent}",end='\r')
             # System health heartbeat every 20 cycles
             if self.cycle_count % 20 == 0:
