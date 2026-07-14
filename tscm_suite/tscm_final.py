@@ -7592,9 +7592,13 @@ class SSTVDemodulator:
 
     def feed(self, audio_data):
         """Accumulate audio into ring buffer. Called every cycle."""
-        flat = np.asarray(audio_data).flatten()
-        # Fast extend: convert to list and extend
-        self.audio_buffer.extend(flat.tolist())
+        try:
+            flat = np.asarray(audio_data).flatten().astype(np.float64)
+            if len(flat) > 0:
+                self.audio_buffer.extend(flat.tolist())
+                self._feed_count = getattr(self, '_feed_count', 0) + 1
+        except:
+            pass
 
     def scan_buffer(self):
         """Scan accumulated buffer for complete SSTV frame. Returns frame info or None."""
@@ -7726,8 +7730,9 @@ class SSTVDemodulator:
             ts = time.strftime('%Y%m%d_%H%M%S')
             path = os.path.join(self.sstv_dir, 'sstv_%s_%s_%d.png' % (ts, mode.lower(), self.frame_count))
             img.save(path)
+            img.save(path)
             self.frames.append(path)
-            self.image_buffer = []
+            # Don't clear buffer - keep accumulating for next frame
             return {'path': path, 'mode': mode, 'lines': len(lines), 'frame': self.frame_count,
                     'sync_count': len(sync_starts), 'median_interval': median_int}
         except ImportError:
@@ -7746,7 +7751,8 @@ class SSTVDemodulator:
             'detected_mode': self.current_mode,
             'lines_buffered': len(self.image_buffer),
             'buffer_seconds': round(len(self.audio_buffer) / max(self.sample_rate, 1), 1),
-            'output_dir': self.sstv_dir
+            'output_dir': self.sstv_dir,
+            'feed_count': getattr(self, '_feed_count', 0)
         }
 
 
@@ -8366,6 +8372,53 @@ class TSCMSystem:
         print("="*60)
         print(f" Map: http://localhost:{Config.MAP_PORT}")
         print("="*60)
+
+        # Background: continuous laptop mic reader for SSTV accumulation
+        # Main loop is ~44s/cycle - too slow for SSTV ring buffer
+        def _sstv_mic_feeder():
+            print('[SSTV-FEEDER] thread starting...')
+            import sys; _f=open(r'C:\Users\carpe\.openclaw-autoclaw\workspace\_sstv_debug.txt','a'); _f.write(f'[{time.time()}] SSTV FEEDER ALIVE\n'); _f.flush()
+            self.log.warning('[SSTV-FEEDER] thread starting...')
+            if not SOUNDDEVICE_AVAILABLE:
+                self.log.warning('SSTV mic feeder: sounddevice not available')
+                return
+            try:
+                import sounddevice as sd
+                dev = Config.LAPTOP_MIC_DEVICE_INDEX
+                info = sd.query_devices(dev)
+                nch = max(1, int(info['max_input_channels']))
+                self.log.info(f'SSTV feeder: device={dev} name={info["name"][:30]} max_ch={nch}')
+                try:
+                    stream = sd.RawInputStream(device=dev, samplerate=48000,
+                                               channels=nch, dtype='int16', blocksize=9600)
+                    stream.start()
+                    self.log.info(f'SSTV mic feeder started: dev={dev} ch={nch} 48kHz continuous')
+                    while self.running:
+                        try:
+                            data, overflow = stream.read(9600)
+                            if not overflow and len(data) > 0:
+                                ch0 = data[0::nch]
+                                audio = np.frombuffer(ch0, dtype=np.int16).astype(np.float64) / 32768.0
+                                self.sstv.feed(audio)
+                        except Exception:
+                            time.sleep(0.1)
+                    stream.stop()
+                    stream.close()
+                except Exception as e2:
+                    self.log.info(f'SSTV feeder raw failed ({e2}), trying default device...')
+                    def _cb(indata, frames, time_info, status):
+                        try:
+                            self.sstv.feed(indata.flatten().astype(np.float64))
+                        except: pass
+                    stream2 = sd.InputStream(samplerate=48000, blocksize=9600, callback=_cb)
+                    stream2.start()
+                    self.log.info('SSTV mic feeder started via callback (default device)')
+                    while self.running:
+                        time.sleep(1)
+                    stream2.stop()
+            except Exception as e:
+                self.log.warning(f'SSTV mic feeder failed: {e}')
+        threading.Thread(target=_sstv_mic_feeder, daemon=True, name='sstv-feeder').start()
 
         last_operator_flush=time.time()
         # Randomized active probe intervals to evade attacker pattern detection
