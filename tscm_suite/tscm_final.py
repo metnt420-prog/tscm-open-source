@@ -6538,6 +6538,115 @@ class SpectralCorrelator:
                     })
         return results
 
+class ProbeRequestTracker:
+    """Track WiFi probe requests to detect surveillance devices.
+    Devices scanning for networks send probe requests. Unusual patterns
+    (repeated probes for hidden SSIDs, probing at regular intervals) indicate
+    surveillance/wardriving activity."""
+    def __init__(self, window_s=300):
+        self.probes = []  # [(timestamp, mac, ssid, rssi, channel)]
+        self.window = window_s
+        self.hidden_ssid_probes = 0
+        self.unique_macs = set()
+
+    def record(self, mac, ssid=None, rssi=0, channel=0, timestamp=None):
+        import time as _t
+        if timestamp is None:
+            timestamp = _t.time()
+        if ssid is None:
+            ssid = ''
+        self.probes.append((timestamp, mac, ssid, int(rssi), int(channel)))
+        if not ssid or ssid == '':
+            self.hidden_ssid_probes += 1
+        self.unique_macs.add(mac)
+        cutoff = timestamp - self.window
+        while self.probes and self.probes[0][0] < cutoff:
+            self.probes.pop(0)
+
+    def analyze(self):
+        """Return probe analysis results."""
+        import time as _t
+        now = _t.time()
+        results = []
+        if not self.probes:
+            return results
+        # Mac frequency analysis
+        from collections import Counter
+        mac_counts = Counter(p[1] for p in self.probes)
+        # High-frequency probers (multiple probes per window)
+        for mac, count in mac_counts.most_common(10):
+            if count < 3:
+                continue
+            mac_probes = [p for p in self.probes if p[1] == mac]
+            ssids = [p[2] for p in mac_probes]
+            hidden_pct = sum(1 for s in ssids if not s) / len(ssids) * 100
+            avg_rssi = sum(p[3] for p in mac_probes) / len(mac_probes)
+            channels = list(set(p[4] for p in mac_probes))
+            if hidden_pct > 50 or count > 10:
+                results.append({
+                    'mac': mac,
+                    'probe_count': count,
+                    'hidden_ssid_pct': hidden_pct,
+                    'avg_rssi': avg_rssi,
+                    'channels': channels,
+                    'classification': 'surveillance_probe' if hidden_pct > 70 else 'aggressive_scanner'
+                })
+        return results
+
+class SignalStrengthDelta:
+    """Track RF power changes over time to detect adversary approach or retreat.
+    Consistently increasing power = platform approaching.
+    Consistently decreasing power = platform retreating.
+    Sudden spike = new emission or close approach."""
+    def __init__(self, history_len=100):
+        self.history = {}  # band_key -> [(timestamp, power_db)]
+        self.max_history = history_len
+
+    def record(self, freq, power_db, timestamp=None):
+        import time as _t
+        if timestamp is None:
+            timestamp = _t.time()
+        band_key = round(freq / 1e6)  # bucket by MHz
+        if band_key not in self.history:
+            self.history[band_key] = []
+        self.history[band_key].append((timestamp, float(power_db)))
+        if len(self.history[band_key]) > self.max_history:
+            self.history[band_key].pop(0)
+
+    def get_trends(self):
+        """Return bands with significant power trends."""
+        import numpy as np
+        results = []
+        stale = []
+        import time as _t
+        now = _t.time()
+        for band, hist in self.history.items():
+            if len(hist) < 20 or hist[-1][0] < now - 120:
+                stale.append(band)
+                continue
+            powers = [h[1] for h in hist]
+            times = [h[0] for h in hist]
+            # Linear regression slope (dB/s)
+            x = np.array(times)
+            y = np.array(powers)
+            x_norm = (x - x.mean()) / (x.std() + 1e-12)
+            slope = float(np.polyfit(x_norm, y, 1)[0])
+            recent = np.mean(powers[-10:])
+            older = np.mean(powers[:10])
+            delta_db = recent - older
+            if abs(delta_db) > 3:  # 3dB change is significant
+                results.append({
+                    'band_mhz': band,
+                    'slope_db_per_norm': slope,
+                    'delta_db': float(delta_db),
+                    'recent_power_db': float(recent),
+                    'samples': len(hist),
+                    'classification': 'approaching' if delta_db > 3 else ('retreating' if delta_db < -3 else 'stable')
+                })
+        for k in stale:
+            self.history.pop(k, None)
+        return sorted(results, key=lambda x: abs(x['delta_db']), reverse=True)
+
 
 class FreqSweep:
     def __init__(self):
@@ -6633,6 +6742,8 @@ class TSCMSystem:
         self.activity_tracker = SignalActivityTracker(window_s=300)
         self.temporal_detector = TemporalPatternDetector(min_period_s=10, max_period_s=600)
         self.spectral_correlator = SpectralCorrelator(correlation_window_s=15)
+        self.probe_tracker = ProbeRequestTracker(window_s=300)
+        self.strength_delta = SignalStrengthDelta(history_len=100)
         # Stingray/IMSI catcher detector for 815-690-6926
         self.stingray = StingrayDetector(self.log, target_number="8156906926")
         # Local WiFi geolocation using RSSI + GPS position history
@@ -7543,6 +7654,7 @@ class TSCMSystem:
                     hackrf_range = max(30, min(2000, 150.0 / max(hackrf_rms, 0.0005)))
                     self.hackrf_range = hackrf_range  # store for downstream detector use
                     self.activity_tracker.update(h_rf_freq, 20*np.log10(hackrf_rms+1e-12), hackrf_rms*1000, now)
+                    self.strength_delta.record(h_rf_freq, 20*np.log10(hackrf_rms+1e-12), now)
                     if hackrf_rms > 0.001:
                         self.localization.add_observation(
                             fingerprint='hackrf_ferrite',
@@ -8641,6 +8753,22 @@ class TSCMSystem:
                         self.log.warning(f'MULTI-BAND: {corr["band_a"]} + {corr["band_b"]} co-occur={corr["co_occurrences"]} ({corr["classification"]})')
                 except: pass
 
+            # Signal strength delta analysis (every 30 cycles)
+            if self.cycle_count % 30 == 0:
+                try:
+                    trends = self.strength_delta.get_trends()
+                    for t in trends[:5]:
+                        self.log.warning(f'POWER DELTA: {t["band_mhz"]}MHz delta={t["delta_db"]:+.1f}dB ({t["classification"]})')
+                except: pass
+
+            # WiFi probe request analysis (every 60 cycles)
+            if self.cycle_count % 60 == 0:
+                try:
+                    probe_results = self.probe_tracker.analyze()
+                    for pr in probe_results[:5]:
+                        self.log.warning(f'WIFI PROBE: {pr["mac"]} count={pr["probe_count"]} hidden={pr["hidden_ssid_pct"]:.0f}% rssi={pr["avg_rssi"]:.0f} ({pr["classification"]})')
+                except: pass
+
             # 10. WiFi AP scanning with LOCAL geolocation + CSI motion detection
             wigle_aps=[]
             aps = []  # initialize before try block — prevents NameError if scan fails
@@ -8660,6 +8788,16 @@ class TSCMSystem:
                             classification='transmitter',
                             detector_name=f'wifi_{cd.get("detector","?")}',
                             snr=0)
+                    # Probe request tracking
+                    try:
+                        for ap in aps:
+                            if ap.get('type') == 'probe' or not ap.get('ssid'):
+                                self.probe_tracker.record(
+                                    mac=ap.get('mac', ap.get('bssid', 'unknown')),
+                                    ssid=ap.get('ssid', ''),
+                                    rssi=ap.get('rssi', ap.get('signal', 0)),
+                                    channel=ap.get('channel', 0))
+                    except: pass
                     # Feed local geolocator with current GPS + AP readings
                     if lat and lon:
                         self.wifi_geo.update_from_gps(lat, lon, aps)
