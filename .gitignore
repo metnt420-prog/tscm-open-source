@@ -64,3 +64,4 @@ gps_home.json
 # Keep docs
 !docs/*.md
 !*.md
+_pages_git/

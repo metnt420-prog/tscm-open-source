@@ -24,6 +24,7 @@ Run as Administrator on Windows 11.
 import sys, os, time, json, threading, queue, struct, hashlib, pickle
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import subprocess, socket, webbrowser, ctypes, tempfile, math, re
+import numpy as np  # global numpy import — used throughout
 from collections import deque, defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -650,8 +651,8 @@ class SourceLocalizationEngine:
             now = time.time()
             for fp, obs_list in data.items():
                 for o in obs_list:
-                    # Only load observations from last 5 minutes
-                    if now - o.get('ts', 0) > 300: continue
+                    # Only load observations from last 1 hour (extended from 5 min)
+                    if now - o.get('ts', 0) > 3600: continue
                     self.observations[fp].append(o)
                     count += 1
             return count
@@ -6648,6 +6649,928 @@ class SignalStrengthDelta:
         return sorted(results, key=lambda x: abs(x['delta_db']), reverse=True)
 
 
+
+
+class AdaptiveSweepPrioritizer:
+    """Tracks which bands are active and extends dwell time on hot bands."""
+    def __init__(self, bands_hackrf, bands_bladerf):
+        self.h_bands = bands_hackrf
+        self.b_bands = bands_bladerf
+        self.band_hits = {}  # band_name -> count of detections in last window
+        self.band_dwell_mult = {}  # band_name -> dwell multiplier (1.0-3.0)
+        self.window = 60  # cycles to consider
+        self.band_timestamps = {}  # band_name -> list of cycle numbers when detections hit
+        for b in bands_hackrf:
+            self.band_hits[b[0]] = 0
+            self.band_dwell_mult[b[0]] = 1.0
+            self.band_timestamps[b[0]] = []
+        for b in bands_bladerf:
+            key = 'bf_' + b[0]
+            self.band_hits[key] = 0
+            self.band_dwell_mult[key] = 1.0
+            self.band_timestamps[key] = []
+
+    def record_hit(self, band_name, cycle):
+        """Record that a detection occurred on this band at this cycle."""
+        if band_name in self.band_timestamps:
+            self.band_timestamps[band_name].append(cycle)
+
+    def get_dwell_multiplier(self, band_name):
+        """Get current dwell multiplier for a band (1.0 = normal, up to 3.0 = triple dwell)."""
+        return self.band_dwell_mult.get(band_name, 1.0)
+
+    def update(self, cycle):
+        """Recalculate multipliers based on recent detection history. Call every cycle."""
+        for name, ts_list in self.band_timestamps.items():
+            # Prune old timestamps outside window
+            cutoff = cycle - self.window
+            self.band_timestamps[name] = [t for t in ts_list if t > cutoff]
+            hit_count = len(self.band_timestamps[name])
+            # Scale: 0 hits = 1.0x, 5+ hits = 3.0x, linear between
+            mult = min(3.0, 1.0 + (hit_count / 5.0) * 2.0)
+            self.band_dwell_mult[name] = mult
+            self.band_hits[name] = hit_count
+
+
+class ThreatScoringEngine:
+    """Combines all detector outputs into a single threat score (0-100) per source."""
+    def __init__(self):
+        self.source_scores = {}  # fingerprint -> score history
+        self.source_max_scores = {}  # fingerprint -> max score ever
+        self.source_danger_history = {}  # fingerprint -> deque of recent scores
+
+    def score_source(self, fingerprint, classification, snr, freq, bearing,
+                     method, observations, has_voice_match, is_fhss,
+                     is_temporal_machine, is_doppler_moving, is_multi_band,
+                     is_approaching, is_power_line_abnormal):
+        """Calculate threat score for a single source. Returns 0-100."""
+        score = 0.0
+
+        # 1. Classification weight (0-25 points)
+        threat_classes = {
+            'microwave_voice': 25, 'mw_carrier': 22, 'pll_carrier': 20,
+            'ultrasound_reradiation': 22, 'forced_thought': 20,
+            'subliminal_audio': 18, 'c2_beacon': 15, 'sstv': 12,
+            'eeg_carrier_mixing': 20, 'brain_acceptance': 18,
+            'jamming': 15, 'power_line_harmonic': 14, 'parametric_amp': 16,
+            'ghost_hunter': 8, 'cable_line': 10, 'ecpri_injection': 12,
+            'satellite_c2': 14, 'wifi_c2': 10, 'stingray': 18,
+            'cell_tower_anomaly': 8, 'wifi_probe_surveillance': 12,
+        }
+        score += threat_classes.get(classification, 5)  # unknown = 5
+
+        # 2. SNR strength (0-20 points) — stronger = closer = more threat
+        if snr and snr > 0:
+            score += min(20, (snr / 30.0) * 20)
+
+        # 3. Observation persistence (0-15 points) — more observations = more persistent
+        if observations:
+            score += min(15, (observations / 50.0) * 15)
+
+        # 4. Localization confidence (0-10 points)
+        if method == 'cross_sensor_triangulation':
+            score += 10
+        elif method in ('bearing_range_est', 'passive_radar_caf'):
+            score += 7
+        elif method == 'bearing_only':
+            score += 4
+
+        # 5. Behavioral indicators (each adds points)
+        if has_voice_match: score += 15  # voice harassment = high threat
+        if is_fhss: score += 10  # evasion technique
+        if is_temporal_machine: score += 10  # automated C2
+        if is_doppler_moving: score += 8  # approaching/retreating platform
+        if is_multi_band: score += 8  # coordinated multi-band attack
+        if is_approaching: score += 5  # getting closer
+        if is_power_line_abnormal: score += 5
+
+        score = min(100.0, score)
+
+        # Store history
+        import collections
+        if fingerprint not in self.source_danger_history:
+            self.source_danger_history[fingerprint] = collections.deque(maxlen=100)
+        self.source_danger_history[fingerprint].append(score)
+        self.source_max_scores[fingerprint] = max(
+            self.source_max_scores.get(fingerprint, 0), score)
+
+        return score
+
+    def get_top_threats(self, n=10):
+        """Return top N threats sorted by current score."""
+        results = []
+        for fp, hist in self.source_danger_history.items():
+            if not hist:
+                continue
+            current = hist[-1]
+            avg = sum(hist) / len(hist)
+            results.append({
+                'fingerprint': fp,
+                'current_score': current,
+                'average_score': avg,
+                'max_score': self.source_max_scores.get(fp, 0),
+                'samples': len(hist),
+                'trend': 'rising' if len(hist) >= 5 and hist[-1] > hist[-5] else
+                         'falling' if len(hist) >= 5 and hist[-1] < hist[-5] else 'stable'
+            })
+        results.sort(key=lambda x: x['current_score'], reverse=True)
+        return results[:n]
+
+    def get_threat_summary(self):
+        """Quick summary: critical, high, medium, low counts."""
+        counts = {'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'MINIMAL': 0}
+        for fp, hist in self.source_danger_history.items():
+            if not hist:
+                continue
+            s = hist[-1]
+            if s >= 70: counts['CRITICAL'] += 1
+            elif s >= 50: counts['HIGH'] += 1
+            elif s >= 30: counts['MEDIUM'] += 1
+            elif s >= 15: counts['LOW'] += 1
+            else: counts['MINIMAL'] += 1
+        return counts
+
+
+class NoiseFloorCalibrator:
+    """Auto-calibrates noise floor per frequency band using sliding window median."""
+    def __init__(self, window_size=50):
+        self.band_floors = {}  # band_name -> deque of noise measurements
+        self.calibrated_floors = {}  # band_name -> current noise floor
+        self.window = window_size
+
+    def add_measurement(self, band_name, noise_level):
+        """Add a noise measurement for a band."""
+        if band_name not in self.band_floors:
+            import collections
+            self.band_floors[band_name] = collections.deque(maxlen=self.window)
+        self.band_floors[band_name].append(noise_level)
+        if len(self.band_floors[band_name]) >= 10:
+            self.calibrated_floors[band_name] = sorted(self.band_floors[band_name])[len(self.band_floors[band_name])//2]
+
+    def get_floor(self, band_name):
+        """Get calibrated noise floor for a band. Returns None if not yet calibrated."""
+        return self.calibrated_floors.get(band_name)
+
+    def get_threshold(self, band_name, multiplier=3.0):
+        """Get detection threshold = floor * multiplier. Falls back to 0 if uncalibrated."""
+        floor = self.get_floor(band_name)
+        if floor is None:
+            return 0
+        return floor * multiplier
+
+    def is_elevated(self, band_name):
+        """Check if current noise is significantly above baseline (>2x floor)."""
+        if band_name not in self.band_floors or not self.band_floors[band_name]:
+            return False
+        floor = self.get_floor(band_name)
+        if floor is None or floor < 1e-12:
+            return False
+        current = self.band_floors[band_name][-1]
+        return current > floor * 2.0
+
+
+
+class BlindSpotAnalyzer:
+    """Identifies frequency bands with weak or zero detection coverage.
+    Reports gaps where the adversary could hide signals."""
+    def __init__(self, all_bands):
+        self.all_bands = all_bands  # list of (name, freq, rate, dwell) tuples
+        self.band_detection_count = {}  # band_name -> total detections
+        self.band_last_seen = {}  # band_name -> last cycle number with a detection
+        self.total_cycles = 0
+        self.gap_threshold_cycles = 30  # report band as 'gap' if no detection in N cycles
+        for b in all_bands:
+            self.band_detection_count[b[0]] = 0
+            self.band_last_seen[b[0]] = 0
+
+    def record_detection(self, band_name, cycle):
+        if band_name in self.band_detection_count:
+            self.band_detection_count[band_name] += 1
+            self.band_last_seen[band_name] = cycle
+
+    def tick(self, cycle):
+        self.total_cycles = cycle
+
+    def get_blind_spots(self):
+        """Return bands with no recent detections (potential gaps)."""
+        gaps = []
+        for b in self.all_bands:
+            name = b[0]
+            cycles_since = self.total_cycles - self.band_last_seen.get(name, 0)
+            if cycles_since > self.gap_threshold_cycles:
+                gaps.append({
+                    'band_name': name,
+                    'freq_mhz': b[1] / 1e6,
+                    'cycles_since_detection': cycles_since,
+                    'total_detections': self.band_detection_count[name],
+                    'severity': 'CRITICAL' if cycles_since > 100 else
+                               'HIGH' if cycles_since > 60 else 'MEDIUM'
+                })
+        gaps.sort(key=lambda x: x['cycles_since_detection'], reverse=True)
+        return gaps
+
+    def get_coverage_report(self):
+        """Return coverage summary for all bands."""
+        total = len(self.all_bands)
+        covered = sum(1 for b in self.all_bands
+                     if self.total_cycles - self.band_last_seen.get(b[0], 0) <= self.gap_threshold_cycles)
+        return {
+            'total_bands': total,
+            'bands_active': covered,
+            'bands_gapped': total - covered,
+            'coverage_pct': (covered / total * 100) if total > 0 else 0,
+            'blind_spots': self.get_blind_spots()
+        }
+
+
+class ModulationFingerprinter:
+    """Classifies modulation type (AM, FM, OOK, SSB, QAM) from IQ samples.
+    Used to fingerprint signals and identify known vs unknown modulation."""
+    def __init__(self, fs=2.4e6):
+        self.fs = fs
+        self.known_fingerprints = {}  # fingerprint_hash -> (mod_type, freq, first_seen)
+        self.unknown_count = 0
+
+    def classify_iq(self, iq_data, freq_center=None):
+        """Classify modulation from complex IQ samples. Returns modulation type + confidence."""
+        import numpy as np
+        if len(iq_data) < 256:
+            return None
+        samples = np.array(iq_data[:4096], dtype=np.complex64)
+        n = len(samples)
+
+        # Extract amplitude and phase
+        amplitude = np.abs(samples)
+        phase = np.angle(samples)
+
+        # Instantaneous frequency (derivative of phase)
+        inst_freq = np.diff(phase)
+        inst_freq = (inst_freq + np.pi) % (2 * np.pi) - np.pi
+
+        # 1. AM detection: amplitude variance high, frequency variance low
+        amp_var = np.var(amplitude) / (np.mean(amplitude) ** 2 + 1e-12)
+        freq_var = np.var(inst_freq)
+
+        # 2. FM detection: amplitude variance low, frequency variance high
+        # 3. OOK detection: amplitude has bimodal distribution (on/off)
+        amp_threshold = np.mean(amplitude)
+        on_fraction = np.sum(amplitude > amp_threshold) / n
+        amp_bimodality = abs(on_fraction - 0.5) * 2  # 1.0 = perfectly bimodal
+
+        # 4. SSB: amplitude nearly constant, phase varies (like FM but single sideband)
+        # 5. QAM/PSK: constellation analysis (if enough samples)
+
+        scores = {}
+        scores['AM'] = min(1.0, amp_var * 10) * (1.0 - min(1.0, freq_var * 5))
+        scores['FM'] = (1.0 - min(1.0, amp_var * 5)) * min(1.0, freq_var * 10)
+        scores['OOK'] = amp_bimodality * min(1.0, amp_var * 8)
+        scores['SSB'] = (1.0 - min(1.0, amp_var * 3)) * min(1.0, freq_var * 3) * 0.6
+        scores['CW'] = (1.0 - amp_var * 10) * (1.0 - freq_var * 10) if amp_var < 0.01 else 0
+
+        # Pick best
+        best = max(scores, key=scores.get)
+        confidence = scores[best]
+
+        if confidence < 0.15:
+            best = 'UNKNOWN'
+            confidence = 0.0
+            self.unknown_count += 1
+
+        # Create fingerprint hash from modulation + freq range characteristics
+        fp = self._fingerprint(samples, best, confidence)
+
+        if fp not in self.known_fingerprints:
+            self.known_fingerprints[fp] = (best, freq_center, time.time())
+
+        return {
+            'modulation': best,
+            'confidence': float(confidence),
+            'all_scores': {k: float(v) for k, v in scores.items()},
+            'amp_var': float(amp_var),
+            'freq_var': float(freq_var),
+            'fingerprint_hash': fp
+        }
+
+    def _fingerprint(self, samples, mod_type, confidence):
+        """Create stable hash from signal characteristics."""
+        import hashlib, numpy as np
+        amp = np.abs(samples[:1024])
+        # Quantize amplitude histogram into 16 bins
+        hist, _ = np.histogram(amp, bins=16)
+        hist_norm = hist / (hist.sum() + 1e-12)
+        key = f"{mod_type}_{hist_norm.tobytes()}"
+        return hashlib.md5(key.encode()).hexdigest()[:12]
+
+    def get_fingerprint_summary(self):
+        """Return all known signal fingerprints."""
+        results = []
+        for fp, (mod, freq, ts) in self.known_fingerprints.items():
+            results.append({
+                'fingerprint': fp,
+                'modulation': mod,
+                'freq': freq,
+                'first_seen': ts
+            })
+        return sorted(results, key=lambda x: x['first_seen'])
+
+
+class CycleAnomalyDetector:
+    """Statistical anomaly detection on per-cycle system metrics.
+    Detects sudden changes in total RF power, source count, bearing variance,
+    noise floor — indicators of new attack vectors or equipment changes."""
+    def __init__(self, window_size=100, z_threshold=2.5):
+        self.window = window_size
+        self.z_threshold = z_threshold
+        self.history = {
+            'total_power_db': deque(maxlen=window_size),
+            'source_count': deque(maxlen=window_size),
+            'bearing_deg': deque(maxlen=window_size),
+            'noise_floor_db': deque(maxlen=window_size),
+            'active_detectors': deque(maxlen=window_size),
+            'voice_events': deque(maxlen=window_size),
+        }
+        self.anomalies = []  # recent anomaly events
+
+    def record_cycle(self, total_power_db=None, source_count=None, bearing=None,
+                     noise_floor_db=None, active_detectors=None, voice_events=0):
+        """Record metrics from the current cycle. Returns list of anomalies."""
+        import numpy as np
+        metrics = {
+            'total_power_db': total_power_db,
+            'source_count': source_count,
+            'bearing_deg': bearing,
+            'noise_floor_db': noise_floor_db,
+            'active_detectors': active_detectors,
+            'voice_events': voice_events
+        }
+        anomalies = []
+        for key, val in metrics.items():
+            if val is None:
+                continue
+            buf = self.history[key]
+            buf.append(val)
+            if len(buf) < 20:  # need enough samples for statistics
+                continue
+            arr = np.array(list(buf))
+            mean = np.mean(arr)
+            std = np.std(arr)
+            if std < 1e-9:  # constant metric
+                continue
+            z = abs(val - mean) / std
+            if z > self.z_threshold:
+                anomaly = {
+                    'metric': key,
+                    'value': val,
+                    'mean': float(mean),
+                    'std': float(std),
+                    'z_score': float(z),
+                    'direction': 'SPIKE' if val > mean else 'DROP'
+                }
+                anomalies.append(anomaly)
+                self.anomalies.append(anomaly)
+        # Keep anomaly list bounded
+        if len(self.anomalies) > 200:
+            self.anomalies = self.anomalies[-100:]
+        return anomalies
+
+    def get_recent_anomalies(self, limit=20):
+        """Return most recent anomalies."""
+        return self.anomalies[-limit:]
+
+    def is_elevated_threat(self):
+        """Quick check: are there more than 2 anomalies in the last 10 cycles?"""
+        if len(self.anomalies) < 2:
+            return False
+        return len(self.anomalies) > 2
+
+
+class SourceLifecycleTracker:
+    """Tracks per-source lifecycle: first seen, last seen, total active time,
+    bearing history, and bearing stability score. Attached to resolve output."""
+    def __init__(self):
+        self.source_registry = {}  # fingerprint -> {first_seen, last_seen, bearings: deque, cycle_count}
+        self.max_bearing_history = 50
+
+    def update(self, fingerprint, bearing, cycle):
+        """Update lifecycle for a source after resolve."""
+        now = time.time()
+        if fingerprint not in self.source_registry:
+            self.source_registry[fingerprint] = {
+                'first_seen': now,
+                'last_seen': now,
+                'bearings': deque(maxlen=self.max_bearing_history),
+                'cycle_count': 0,
+                'total_cycles': 0
+            }
+        entry = self.source_registry[fingerprint]
+        entry['last_seen'] = now
+        entry['cycle_count'] += 1
+        entry['total_cycles'] += 1
+        if bearing is not None:
+            entry['bearings'].append(bearing)
+
+    def get_lifecycle(self, fingerprint):
+        """Return lifecycle metadata for a source."""
+        entry = self.source_registry.get(fingerprint)
+        if not entry:
+            return None
+        bearing_list = list(entry['bearings'])
+        bearing_stability = 0.0
+        if len(bearing_list) >= 5:
+            std = np.std(bearing_list)
+            # stability: 1.0 = perfectly stable, 0.0 = all over the place
+            # < 5 deg std = very stable, > 30 deg = unstable
+            bearing_stability = max(0.0, min(1.0, 1.0 - std / 30.0))
+        active_seconds = entry['last_seen'] - entry['first_seen']
+        return {
+            'first_seen': entry['first_seen'],
+            'last_seen': entry['last_seen'],
+            'active_seconds': active_seconds,
+            'bearing_count': len(bearing_list),
+            'bearing_stability': round(bearing_stability, 3),
+            'bearing_std': round(float(np.std(bearing_list)), 2) if len(bearing_list) >= 5 else None,
+            'bearing_median': round(float(np.median(bearing_list)), 1) if bearing_list else None,
+            'detection_count': entry['cycle_count']
+        }
+
+    def get_all_lifecycles(self):
+        """Return lifecycle for all tracked sources."""
+        return {fp: self.get_lifecycle(fp) for fp in self.source_registry}
+
+    def prune_stale(self, max_age_s=3600):
+        """Remove sources not seen in max_age_s seconds."""
+        now = time.time()
+        stale = [fp for fp, e in self.source_registry.items() if now - e['last_seen'] > max_age_s]
+        for fp in stale:
+            self.source_registry.pop(fp, None)
+        return len(stale)
+
+
+class CoOccurrenceTracker:
+    """Tracks which sources appear together in the same detection cycle.
+    Sources that frequently co-occur are likely the same physical platform."""
+    def __init__(self):
+        self.pair_counts = {}  # (fp_a, fp_b) -> count (sorted tuple)
+        self.source_counts = {}  # fp -> total cycle appearances
+        self.window = 200  # track last N cycles
+        self.cycle_fingerprints = deque(maxlen=self.window)  # sets of fingerprints per cycle
+
+    def record_cycle(self, fingerprints):
+        """Record which fingerprints appeared this cycle."""
+        fps = set(fingerprints)
+        self.cycle_fingerprints.append(fps)
+        for fp in fps:
+            self.source_counts[fp] = self.source_counts.get(fp, 0) + 1
+        # Count pairs within this cycle
+        fp_list = sorted(fps)
+        for i in range(len(fp_list)):
+            for j in range(i + 1, len(fp_list)):
+                pair = (fp_list[i], fp_list[j])
+                self.pair_counts[pair] = self.pair_counts.get(pair, 0) + 1
+
+    def get_correlated_pairs(self, min_cycles=5, min_jaccard=0.3):
+        """Return source pairs that co-occur significantly.
+        Jaccard index measures overlap: 1.0 = always together, 0.0 = never."""
+        results = []
+        for (fp_a, fp_b), count in self.pair_counts.items():
+            if count < min_cycles:
+                continue
+            count_a = self.source_counts.get(fp_a, 0)
+            count_b = self.source_counts.get(fp_b, 0)
+            jaccard = count / max(count_a, count_b)  # conservative Jaccard
+            if jaccard >= min_jaccard:
+                results.append({
+                    'fp_a': fp_a, 'fp_b': fp_b,
+                    'co_occurrences': count,
+                    'count_a': count_a, 'count_b': count_b,
+                    'jaccard': round(jaccard, 3)
+                })
+        results.sort(key=lambda x: x['jaccard'], reverse=True)
+        return results
+
+    def get_cluster_report(self):
+        """Group sources into clusters based on co-occurrence."""
+        pairs = self.get_correlated_pairs(min_cycles=3, min_jaccard=0.2)
+        # Simple union-find clustering
+        parent = {}
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+        for p in pairs:
+            union(p['fp_a'], p['fp_b'])
+        # Group by root
+        clusters = {}
+        for fp in self.source_counts:
+            root = find(fp)
+            if root not in clusters:
+                clusters[root] = []
+            clusters[root].append(fp)
+        # Only return multi-source clusters
+        multi = {r: fps for r, fps in clusters.items() if len(fps) > 1}
+        return {
+            'total_clusters': len(multi),
+            'clusters': [{'size': len(fps), 'fingerprints': fps} for fps in sorted(multi.values(), key=lambda x: -len(x))]
+        }
+
+
+class AnalogVideoDemodulator:
+    """Demodulates analog NTSC/PAL video from IQ data.
+    Detects AM vestigial sideband video carriers at known video frequencies.
+    Produces video frames from the demodulated signal."""
+    def __init__(self, sample_rate=2.4e6):
+        self.fs = sample_rate
+        self.video_carriers = []  # list of detected video carriers
+        self.frame_buffer = deque(maxlen=30)  # last 30 frames
+        self.frame_count = 0
+        # NTSC parameters
+        self.line_rate = 15734.26  # Hz (horizontal sync frequency)
+        self.field_rate = 59.94  # Hz
+        self.line_duration = 1.0 / self.line_rate  # ~63.5us per line
+        self.active_lines = 480  # NTSC active lines per frame
+        self.samples_per_line = int(self.line_duration * self.fs)
+        # Video output directory
+        self.video_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'video_captures')
+        os.makedirs(self.video_dir, exist_ok=True)
+        self.last_video_time = 0
+
+    def detect_video_carrier(self, iq_data, center_freq):
+        """Detect wideband AM carriers characteristic of analog video (6MHz wide)."""
+        import numpy as np
+        if len(iq_data) < 2048:
+            return None
+        samples = np.array(iq_data, dtype=np.complex64)
+        n = len(samples)
+
+        # FFT to find spectrum
+        fft = np.abs(np.fft.fftshift(np.fft.fft(samples[:4096])))
+        fft_db = 20 * np.log10(fft + 1e-12)
+
+        # Smooth the spectrum to find wideband carriers
+        kernel_size = max(1, int(6e6 / (self.fs / 4096)))  # 6MHz in bins
+        if kernel_size < 3:
+            kernel_size = 3
+        kernel = np.ones(kernel_size) / kernel_size
+        smoothed = np.convolve(fft_db, kernel, mode='same')
+
+        # Find peaks that are wideband (>2MHz bandwidth)
+        noise_floor = np.median(fft_db)
+        threshold = noise_floor + 12  # 12dB above noise
+
+        peaks, props = scipy.signal.find_peaks(smoothed, height=threshold, prominence=8)
+        if len(peaks) == 0:
+            return None
+
+        # Check peak bandwidth (width at half-max)
+        results = []
+        for pk in peaks:
+            half_max = smoothed[pk] - 3
+            left = pk
+            while left > 0 and smoothed[left] > half_max:
+                left -= 1
+            right = pk
+            while right < len(smoothed) - 1 and smoothed[right] > half_max:
+                right += 1
+            bw_bins = right - left
+            bw_hz = bw_bins * self.fs / 4096
+            freq_offset = (pk - 2048) * self.fs / 4096
+            actual_freq = center_freq + freq_offset
+            snr = smoothed[pk] - noise_floor
+
+            # Video carriers are typically 4-8 MHz wide
+            if 3e6 < bw_hz < 10e6:
+                results.append({
+                    'freq': actual_freq,
+                    'offset_hz': freq_offset,
+                    'bandwidth_hz': bw_hz,
+                    'snr': snr,
+                    'type': 'NTSC' if abs(self.line_rate - bw_hz/256) < 500 else 'PAL' if abs(self.line_rate*1.02 - bw_hz/312) < 500 else 'ANALOG_VIDEO'
+                })
+
+        if results:
+            best = max(results, key=lambda x: x['snr'])
+            self.video_carriers.append(best)
+            if len(self.video_carriers) > 100:
+                self.video_carriers = self.video_carriers[-50:]
+            return best
+        return None
+
+    def demodulate_frame(self, iq_data, carrier_offset_hz):
+        """Demodulate AM video from IQ data. Returns a PIL Image or None."""
+        import numpy as np
+        try:
+            samples = np.array(iq_data[:65536], dtype=np.complex64)
+            if len(samples) < 4096:
+                return None
+
+            # Frequency shift to baseband the carrier
+            t = np.arange(len(samples)) / self.fs
+            mixer = np.exp(-1j * 2 * np.pi * carrier_offset_hz * t)
+            baseband = samples * mixer
+
+            # AM demodulation: take magnitude
+            video_signal = np.abs(baseband)
+            # Remove DC offset
+            video_signal = video_signal - np.mean(video_signal)
+            # Normalize
+            video_signal = video_signal / (np.max(np.abs(video_signal)) + 1e-12)
+
+            # Simple frame reconstruction: reshape into lines
+            spl = max(self.samples_per_line, 64)
+            n_lines = len(video_signal) // spl
+            if n_lines < 100:
+                return None
+
+            # Reshape to image (lines x samples_per_line)
+            frame_data = video_signal[:n_lines * spl].reshape(n_lines, spl)
+            # Subsample horizontally to get reasonable aspect ratio
+            cols = min(640, spl)
+            frame_resized = frame_data[:, :cols]
+
+            # Scale to 0-255
+            frame_uint8 = np.clip(frame_resized * 255, 0, 255).astype(np.uint8)
+
+            # Try to save as image
+            try:
+                from PIL import Image
+                img = Image.fromarray(frame_uint8, mode='L')
+                self.frame_buffer.append(img)
+                self.frame_count += 1
+                # Save frame every 10
+                if self.frame_count % 10 == 0:
+                    path = os.path.join(self.video_dir, 'frame_%06d.png' % self.frame_count)
+                    img.save(path)
+                return img
+            except ImportError:
+                # No PIL, skip image generation
+                return None
+        except Exception as e:
+            return None
+
+    def get_status(self):
+        """Return detection summary."""
+        return {
+            'carriers_detected': len(self.video_carriers),
+            'frames_captured': self.frame_count,
+            'last_carrier': self.video_carriers[-1] if self.video_carriers else None,
+            'output_dir': self.video_dir
+        }
+
+
+class WiFiVideoCapture:
+    """Captures unencrypted WiFi video streams from nearby APs.
+    Monitors for high-bandwidth UDP streams characteristic of video."""
+    def __init__(self):
+        self.captured_streams = []
+        self.high_bw_aps = {}  # BSSID -> {bytes_sec, last_seen}
+
+    def update(self, access_points):
+        """Check WiFi APs for video-like activity (high bandwidth indicators)."""
+        now = time.time()
+        for ap in access_points:
+            bssid = ap.get('bssid', ap.get('mac', ''))
+            signal = abs(ap.get('signal', ap.get('rssi', -100)))
+            ssid = ap.get('ssid', '')
+            # Strong signal + hidden SSID + no encryption = potential surveillance
+            is_hidden = ssid == '' or ssid.lower() == ''
+            is_strong = signal > 70
+            if is_strong:
+                self.high_bw_aps[bssid] = {
+                    'bssid': bssid,
+                    'ssid': ssid if ssid else '[HIDDEN]',
+                    'signal': signal,
+                    'last_seen': now,
+                    'hidden': is_hidden,
+                    'channel': ap.get('channel', 0)
+                }
+        # Prune old entries
+        stale = [k for k, v in self.high_bw_aps.items() if now - v['last_seen'] > 300]
+        for k in stale:
+            self.high_bw_aps.pop(k, None)
+
+    def get_suspicious_aps(self):
+        """Return APs that could be transmitting video."""
+        results = []
+        for bssid, info in self.high_bw_aps.items():
+            if info['hidden'] and info['signal'] > 80:
+                results.append({**info, 'classification': 'possible_video_relay'})
+            elif info['signal'] > 85:
+                results.append({**info, 'classification': 'high_power_ap'})
+        return sorted(results, key=lambda x: x['signal'], reverse=True)
+
+
+class MeshNetworkDetector:
+    """Detects WiFi mesh/virtual AP clusters.
+    Multiple APs with similar BSSIDs across channels = single physical device.
+    Critical for identifying the adversary's relay infrastructure."""
+    def __init__(self):
+        self.ap_history = {}  # BSSID -> {ssid, channels:set, signals:list, first_seen, last_seen}
+        self.mesh_clusters = []  # list of {root_bssid_prefix, member_count, channels, hidden_ratio}
+
+    def update(self, access_points):
+        """Process WiFi scan results, track APs, detect mesh patterns."""
+        now = time.time()
+        for ap in access_points:
+            bssid = ap.get('bssid', ap.get('mac', ''))
+            if not bssid:
+                continue
+            signal = abs(ap.get('signal', ap.get('rssi', -100)))
+            ssid = ap.get('ssid', '')
+            channel = ap.get('channel', 0)
+            if bssid not in self.ap_history:
+                self.ap_history[bssid] = {
+                    'ssid': ssid,
+                    'channels': set(),
+                    'signals': deque(maxlen=50),
+                    'first_seen': now,
+                    'last_seen': now,
+                    'hidden': ssid == '' or ssid.lower() == ''
+                }
+            entry = self.ap_history[bssid]
+            entry['last_seen'] = now
+            entry['channels'].add(channel)
+            entry['signals'].append(signal)
+            entry['hidden'] = entry['hidden'] or (ssid == '' or ssid.lower() == '')
+        self._detect_mesh()
+
+    def _detect_mesh(self):
+        """Find groups of APs with similar BSSID OUI prefixes."""
+        oui_groups = {}  # first 3 octets -> list of BSSIDs
+        for bssid in self.ap_history:
+            octets = bssid.lower().replace('-', ':').split(':')
+            if len(octets) >= 3:
+                # Use first 3 octets as OUI, but also check 4th for vendor pattern
+                oui = ':'.join(octets[:3])
+                if oui not in oui_groups:
+                    oui_groups[oui] = []
+                oui_groups[oui].append(bssid)
+        self.mesh_clusters = []
+        for oui, bssids in oui_groups.items():
+            if len(bssids) < 2:
+                continue
+            # Check if they share similar 4th octet pattern (mesh typically increments last octet)
+            entries = [(b, self.ap_history[b]) for b in bssids]
+            hidden_count = sum(1 for _, e in entries if e['hidden'])
+            all_channels = set()
+            for _, e in entries:
+                all_channels.update(e['channels'])
+            avg_signal = sum(sum(e['signals'])/max(len(e['signals']),1) for _, e in entries) / len(entries)
+            cluster = {
+                'oui': oui,
+                'member_count': len(bssids),
+                'bssids': bssids,
+                'channels': sorted(all_channels),
+                'hidden_count': hidden_count,
+                'hidden_ratio': round(hidden_count / len(bssids), 2),
+                'avg_signal': round(avg_signal, 1),
+                'classification': 'mesh_network' if len(bssids) >= 3 and hidden_count >= 1 else 'multi_ap',
+                'threat_level': 'HIGH' if len(bssids) >= 5 and hidden_count >= 2 else 'MEDIUM' if len(bssids) >= 3 else 'LOW'
+            }
+            self.mesh_clusters.append(cluster)
+        self.mesh_clusters.sort(key=lambda x: x['member_count'], reverse=True)
+
+    def get_report(self):
+        """Return mesh detection report."""
+        total_aps = len(self.ap_history)
+        mesh_aps = sum(c['member_count'] for c in self.mesh_clusters if c['classification'] == 'mesh_network')
+        return {
+            'total_unique_aps': total_aps,
+            'mesh_clusters': self.mesh_clusters[:10],
+            'mesh_ap_count': mesh_aps,
+            'suspicious_oui_count': len([c for c in self.mesh_clusters if c['threat_level'] in ('HIGH', 'MEDIUM')])
+        }
+
+
+class SignalIntelligenceAnalyzer:
+    """Deep signal intelligence: correlates RF detections with known adversary techniques.
+    Builds an attack profile from observed signal patterns."""
+    def __init__(self):
+        self.attack_profile = {
+            'voice_transmission': False,
+            'video_relay': False,
+            'c2_polling': False,
+            'freq_hopping': False,
+            'power_line_injection': False,
+            'bistatic_radar': False,
+            'multipath_exploitation': False,
+            'wifi_mesh_relay': False,
+            'ultrasonic': False,
+            'subaudible': False
+        }
+        self.technique_evidence = {}  # technique -> list of evidence entries
+        self.last_profile_update = 0
+
+    def update(self, sources, cycle_count):
+        """Update attack profile based on current detections."""
+        now = time.time()
+        if now - self.last_profile_update < 30:
+            return
+        self.last_profile_update = now
+
+        detections = {}
+        for src in sources:
+            cls = str(src.get('classification', '')).lower()
+            det = str(src.get('detector', '')).lower()
+            fp = str(src.get('fingerprint', ''))[:40]
+
+            if any(k in fp or k in det for k in ['voice', 'mw_carrier', 'mw_voice']):
+                self._record('voice_transmission', {'fingerprint': fp, 'detector': det, 'bearing': src.get('bearing')})
+            if 'video' in cls or 'video' in det or 'relay' in cls:
+                self._record('video_relay', {'fingerprint': fp, 'detector': det})
+            if 'c2' in fp or 'c2' in det or 'polling' in cls or 'bpsk' in cls:
+                self._record('c2_polling', {'fingerprint': fp, 'detector': det, 'type': 'BPSK burst'})
+            if 'fhss' in det or 'hopping' in cls:
+                self._record('freq_hopping', {'fingerprint': fp, 'detector': det})
+            if 'power_line' in det or 'harmonic' in cls:
+                self._record('power_line_injection', {'fingerprint': fp, 'detector': det})
+            if 'bistatic' in det or 'radar' in cls:
+                self._record('bistatic_radar', {'fingerprint': fp, 'detector': det})
+            if 'multipath' in det or 'ducting' in cls:
+                self._record('multipath_exploitation', {'fingerprint': fp, 'detector': det})
+            if 'mesh' in det or 'relay' in cls:
+                self._record('wifi_mesh_relay', {'fingerprint': fp, 'detector': det})
+            if 'ultrasonic' in det or 'infrasound' in cls or 'subaudible' in cls:
+                self._record('ultrasonic', {'fingerprint': fp, 'detector': det})
+
+    def _record(self, technique, evidence):
+        if technique not in self.technique_evidence:
+            self.technique_evidence[technique] = deque(maxlen=50)
+        self.technique_evidence[technique].append({**evidence, 'time': time.time()})
+        self.attack_profile[technique] = True
+
+    def get_profile(self):
+        """Return current attack profile."""
+        active = sum(1 for v in self.attack_profile.values() if v)
+        evidence_counts = {k: len(v) for k, v in self.technique_evidence.items()}
+        return {
+            'active_techniques': active,
+            'max_possible': len(self.attack_profile),
+            'attack_surface': round(active / len(self.attack_profile) * 100, 1),
+            'techniques': {k: {'active': v, 'evidence_count': evidence_counts.get(k, 0)} for k, v in self.attack_profile.items()},
+            'latest_evidence': {k: list(v)[-1] if v else None for k, v in self.technique_evidence.items()}
+        }
+
+
+class BearingHeatmapLogger:
+    """Persists bearing observations to disk as JSON for cross-session analysis.
+    Generates a cumulative bearing histogram that survives restarts."""
+    def __init__(self, persist_dir=None):
+        if persist_dir is None:
+            persist_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bearing_history')
+        self.persist_dir = persist_dir
+        os.makedirs(persist_dir, exist_ok=True)
+        self.current_hour = {}  # bearing_bin (5deg) -> count
+        self.bin_size = 5  # degrees
+        self.daily_file = os.path.join(persist_dir, 'daily_%s.json' % time.strftime('%Y%m%d'))
+        self._load_daily()
+
+    def _load_daily(self):
+        """Load today's bearing data from disk."""
+        if os.path.exists(self.daily_file):
+            try:
+                with open(self.daily_file, 'r') as f:
+                    self.current_hour = json.load(f)
+            except:
+                self.current_hour = {}
+
+    def record(self, bearing, weight=1.0):
+        """Record a bearing observation."""
+        if bearing is None:
+            return
+        b = ((int(bearing) % 360) // self.bin_size) * self.bin_size
+        key = str(b)
+        self.current_hour[key] = self.current_hour.get(key, 0) + weight
+
+    def save(self):
+        """Save current data to daily file."""
+        try:
+            with open(self.daily_file, 'w') as f:
+                json.dump(self.current_hour, f, indent=2)
+        except:
+            pass
+
+    def get_hot_bearings(self, top_n=10):
+        """Return bearing directions with most observations."""
+        sorted_bins = sorted(self.current_hour.items(), key=lambda x: x[1], reverse=True)
+        return [{'bearing': int(k), 'count': v, 'sector': '%d-%d' % (int(k), int(k)+self.bin_size)}
+                for k, v in sorted_bins[:top_n]]
+
+    def get_heatmap_data(self):
+        """Return 72-segment (5-degree) heatmap for visualization."""
+        segments = []
+        for deg in range(0, 360, self.bin_size):
+            key = str(deg)
+            count = self.current_hour.get(key, 0)
+            segments.append({'bearing': deg, 'count': count})
+        return segments
+
+
 class FreqSweep:
     def __init__(self):
         self.hbands=HACKRF_SWEEP;self.bbands=BLADERF_SWEEP
@@ -6825,6 +7748,30 @@ class TSCMSystem:
         self.neural = NeuralDetector()  # GPU signal intelligence
         self.sweep = FreqSweep()  # full-spectrum frequency sweeper
         self.fhss_tracker = FrequencyHoppingTracker(max_window_s=180, min_freq_stops=3)
+        self.adaptive_sweep = AdaptiveSweepPrioritizer(HACKRF_SWEEP, BLADERF_SWEEP)
+        self.threat_engine = ThreatScoringEngine()
+        self.noise_cal = NoiseFloorCalibrator(window_size=50)
+        # Blind spot analysis: find bands with no detections (coverage gaps)
+        all_bands = list(HACKRF_SWEEP) + list(BLADERF_SWEEP)
+        self.blind_spot = BlindSpotAnalyzer(all_bands)
+        # Modulation fingerprinting: classify AM/FM/OOK/SSB from IQ data
+        self.mod_fingerprinter = ModulationFingerprinter(fs=Config.HACKRF_SAMPLE_RATE)
+        # Cycle anomaly detection: statistical outlier detection on per-cycle metrics
+        self.cycle_anomaly = CycleAnomalyDetector(window_size=100, z_threshold=2.5)
+        # Source lifecycle tracking: per-source first_seen, last_seen, bearing stability
+        self.source_lifecycle = SourceLifecycleTracker()
+        # Co-occurrence tracker: which sources appear together (same platform?)
+        self.cooccurrence = CoOccurrenceTracker()
+        # Analog video demodulation: capture video frames from wideband AM carriers
+        self.video_demod = AnalogVideoDemodulator(sample_rate=Config.HACKRF_SAMPLE_RATE)
+        # WiFi video capture: find suspicious APs that could relay video
+        self.wifi_video = WiFiVideoCapture()
+        # WiFi mesh network detection: find virtual AP clusters from same device
+        self.mesh_detector = MeshNetworkDetector()
+        # Signal intelligence: build adversary attack profile from detection patterns
+        self.sigint = SignalIntelligenceAnalyzer()
+        # Bearing heatmap: persist bearing observations across restarts
+        self.bearing_heatmap = BearingHeatmapLogger()
         self.null_enabled = Config.ENABLE_NULL_STEERING
         if self.null_enabled:
             # TX bias tee: enable in the RX capture loop (same bladeRF session)
@@ -7527,6 +8474,7 @@ class TSCMSystem:
                         fft_hack = np.abs(np.fft.rfft(iq_hack[-4096:]))
                         freqs = np.fft.rfftfreq(4096, 1/Config.HACKRF_SAMPLE_RATE) + Config.HACKRF_FREQ_TARGET
                         noise_floor = np.median(fft_hack)
+                        self.noise_cal.add_measurement(h_name, noise_floor)
                         peaks, props = find_peaks(fft_hack, height=noise_floor*3, distance=20)  # was 5x
                         for pk in peaks[:5]:
                             carrier_freq = freqs[pk]
@@ -7547,9 +8495,29 @@ class TSCMSystem:
                                     classification='transmitter',
                                     detector_name='rf_carrier_scan',
                                     snr=float(snr))
+                                self.adaptive_sweep.record_hit(h_name, self.cycle_count)
+                                self.blind_spot.record_detection(h_name, self.cycle_count)
+                                # Analog video carrier detection on video bands (2.4G + 5.8G)
+                                # Only scan when we have enough IQ data and at video frequencies
+                                if h_freq > 5e9 and hack and len(hack['data']) > 8192 and self.cycle_count % 10 == 0:
+                                    try:
+                                        vc = self.video_demod.detect_video_carrier(hack['data'], h_freq)
+                                        if vc:
+                                            self.log.warning(f'VIDEO CARRIER: {vc["freq"]/1e6:.1f}MHz BW={vc["bandwidth_hz"]/1e6:.1f}MHz SNR={vc["snr"]:.0f}dB type={vc["type"]}')
+                                            self.localization.add_observation(
+                                                fingerprint=f'video_{vc["freq"]:.0f}'.encode(),
+                                                obs_lat=lat, obs_lon=lon,
+                                                bearing_deg=self.aoa if self.aoa else None,
+                                                range_m=None, freq=vc['freq'],
+                                                classification='video_carrier',
+                                                detector_name='video_demod',
+                                                snr=vc['snr'])
+                                            frame = self.video_demod.demodulate_frame(hack['data'], vc['offset_hz'])
+                                            if frame:
+                                                self.log.info(f'VIDEO FRAME captured (#{self.video_demod.frame_count})')
+                                    except: pass
                     except: pass
                 # HACKRF FERRITE LOOP DIRECTION FINDING
-                # The ferrite loop is pointed at Larkin Ave (13deg  from north)
                 # Peak = source at 13deg , Null = source at 103deg  or 283deg
                 # Compare HackRF signal power with BladeRF (omni reference)
                 hackrf_power = np.sqrt(np.mean(np.abs(iq_hack)**2))
@@ -8282,8 +9250,7 @@ class TSCMSystem:
 
                     # Compute noise floor per octave (handles varying noise across spectrum)
                     noise_floor = np.median(scan_fft) + 1e-12
-
-                    # Find ALL peaks above 3x noise - any frequency, no band limits
+                    self.noise_cal.add_measurement('bladerf_scan', noise_floor)
                     peaks, props = find_peaks(scan_fft, height=noise_floor*3, distance=5, prominence=noise_floor*1.5)
 
                     for pk in peaks[:10]:  # top 10 carriers
@@ -8677,6 +9644,85 @@ class TSCMSystem:
             sources=self.localization.resolve_sources(lat,lon)
             self.last_sources=sources
 
+            # 9a. Threat scoring - score all sources
+            try:
+                threat_counts = self.threat_engine.get_threat_summary()
+                for src in sources:
+                    fp = src.get('fingerprint', '?')
+                    cls = src.get('classification', '')
+                    snr = src.get('snr', 0)
+                    freq = src.get('freq', 0)
+                    bearing = src.get('bearing')
+                    method = src.get('method', '')
+                    obs = src.get('observations', 0)
+                    score = self.threat_engine.score_source(
+                        fingerprint=fp, classification=cls, snr=snr, freq=freq,
+                        bearing=bearing, method=method, observations=obs,
+                        has_voice_match=('voice' in cls.lower() or 'microwave' in cls.lower()),
+                        is_fhss=('fhss' in cls.lower() or 'hopping' in cls.lower()),
+                        is_temporal_machine=(obs > 100),
+                        is_doppler_moving=('doppler' in src.get('detector', '')),
+                        is_multi_band=('multi' in cls.lower() or 'band' in cls.lower()),
+                        is_approaching=(src.get('classification', '') == 'approaching'),
+                        is_power_line_abnormal=('power_line' in cls.lower() and snr > 5))
+                    src['threat_score'] = score
+                top_threats = self.threat_engine.get_top_threats(5)
+                if top_threats:
+                    self.log.warning(f'THREAT: {threat_counts} | top={top_threats[0]["current_score"]:.0f}/100 ({top_threats[0]["fingerprint"][:30]})')
+            except: pass
+
+            # Update source lifecycle (bearing stability, active time) and co-occurrence
+            try:
+                cycle_fps = []
+                for src in sources:
+                    fp = src.get('fingerprint', b'').hex() if isinstance(src.get('fingerprint'), bytes) else str(src.get('fingerprint', ''))
+                    bearing = src.get('bearing')
+                    self.source_lifecycle.update(fp, bearing, self.cycle_count)
+                    if fp:
+                        cycle_fps.append(fp)
+                    lc = self.source_lifecycle.get_lifecycle(fp)
+                    if lc:
+                        src['active_seconds'] = lc['active_seconds']
+                        src['bearing_stability'] = lc['bearing_stability']
+                        src['bearing_std'] = lc.get('bearing_std')
+                        src['bearing_median'] = lc.get('bearing_median')
+                        src['detection_count'] = lc['detection_count']
+                self.cooccurrence.record_cycle(cycle_fps)
+                # Record bearings for heatmap persistence
+                for src in sources:
+                    b = src.get('bearing')
+                    if b is not None:
+                        self.bearing_heatmap.record(b)
+                # Save heatmap every 50 cycles
+                if self.cycle_count % 50 == 0:
+                    self.bearing_heatmap.save()
+                # Prune stale lifecycle entries every 100 cycles
+                if self.cycle_count % 100 == 0:
+                    pruned = self.source_lifecycle.prune_stale(3600)
+                    if pruned:
+                        self.log.info(f'LIFECYCLE: pruned {pruned} stale sources')
+                # Report co-occurrence clusters every 60 cycles
+                if self.cycle_count % 60 == 0:
+                    clusters = self.cooccurrence.get_cluster_report()
+                    if clusters['total_clusters'] > 0:
+                        for c in clusters['clusters'][:5]:
+                            self.log.warning(f'CLUSTER: {c["size"]} sources co-occurring')
+            except: pass
+
+            # Signal intelligence: update adversary attack profile
+            try:
+                self.sigint.update(sources, self.cycle_count)
+                if self.cycle_count % 30 == 0:
+                    profile = self.sigint.get_profile()
+                    active = profile['active_techniques']
+                    surface = profile['attack_surface']
+                    self.log.warning(f'SIGINT: {active}/{profile["max_possible"]} techniques active ({surface:.0f}% attack surface)')
+                    for tech, info in profile['techniques'].items():
+                        if info['active']:
+                            self.log.info(f'  ACTIVE: {tech} ({info["evidence_count"]} evidence entries)')
+            except Exception as e:
+                self.log.error(f'SIGINT error: {e}')
+
             # 9b. Frequency hopping detection
             fhss_results = self.fhss_tracker.detect_fhss(now)
             for fh in fhss_results:
@@ -8769,6 +9815,80 @@ class TSCMSystem:
                         self.log.warning(f'WIFI PROBE: {pr["mac"]} count={pr["probe_count"]} hidden={pr["hidden_ssid_pct"]:.0f}% rssi={pr["avg_rssi"]:.0f} ({pr["classification"]})')
                 except: pass
 
+            # Blind spot analysis (every 30 cycles) — find coverage gaps
+            if self.cycle_count % 30 == 0:
+                try:
+                    self.blind_spot.tick(self.cycle_count)
+                    coverage = self.blind_spot.get_coverage_report()
+                    if coverage['bands_gapped'] > 0:
+                        gaps = coverage['blind_spots'][:3]
+                        gap_str = ', '.join(
+                            f"{g['band_name']}({g['freq_mhz']:.0f}MHz {g['severity']}:no detect {g['cycles_since_detection']}cyc)"
+                            for g in gaps)
+                        self.log.warning(f'BLIND SPOT: {coverage["coverage_pct"]:.0f}% coverage | gaps: {gap_str}')
+                    else:
+                        self.log.info(f'BLIND SPOT: {coverage["coverage_pct"]:.0f}% coverage, all bands active')
+                except: pass
+
+            # WiFi video surveillance AP detection (every 30 cycles)
+            if self.cycle_count % 30 == 0:
+                try:
+                    sus_aps = self.wifi_video.get_suspicious_aps()
+                    for sap in sus_aps[:3]:
+                        self.log.warning(f'WIFI VIDEO: %s sig=%d ch=%d [%s]' % (
+                            sap['bssid'], sap['signal'], sap.get('channel',0), sap['classification']))
+                except: pass
+
+            # Mesh network detection report
+            if self.cycle_count % 15 == 0:
+                try:
+                    mr = self.mesh_detector.get_report()
+                    for cluster in mr.get('mesh_clusters', []):
+                        if cluster['classification'] == 'mesh_network':
+                            self.log.warning(f'MESH: {cluster["member_count"]} APs OUI={cluster["oui"]} ch={cluster["channels"]} hidden={cluster["hidden_ratio"]:.0%} threat={cluster["threat_level"]}')
+                except Exception as e:
+                    self.log.error(f'MESH error: {e}')
+            if self.cycle_count % 30 == 0 and self.video_demod.frame_count > 0:
+                vs = self.video_demod.get_status()
+                self.log.info(f'VIDEO: %d carriers detected, %d frames captured, dir=%s' % (
+                    vs['carriers_detected'], vs['frames_captured'], vs['output_dir']))
+
+            # Modulation fingerprinting — classify IQ from HackRF when available
+            if hack and len(hack['data']) > 512 and self.cycle_count % 5 == 0:
+                try:
+                    mod_result = self.mod_fingerprinter.classify_iq(hack['data'][:4096], h_freq)
+                    if mod_result and mod_result['confidence'] > 0.3:
+                        mod = mod_result['modulation']
+                        conf = mod_result['confidence']
+                        fp = mod_result['fingerprint_hash']
+                        if mod != 'UNKNOWN':
+                            self.localization.add_observation(
+                                fingerprint=f'mod_{fp}'.encode(),
+                                obs_lat=lat, obs_lon=lon,
+                                bearing_deg=self.aoa if self.aoa else None,
+                                range_m=None, freq=h_freq,
+                                classification='transmitter',
+                                detector_name=f'mod_{mod.lower()}',
+                                snr=conf * 20)
+                            if self.cycle_count % 20 == 0:
+                                self.log.info(f'MODULATION: {mod} conf={conf:.2f} at {h_freq/1e6:.0f}MHz fp={fp}')
+                except: pass
+
+            # Cycle anomaly detection — detect statistical outliers in system metrics
+            if self.cycle_count % 5 == 0:
+                try:
+                    total_power = np.sqrt(np.mean(np.abs(hack['data'])**2)) if hack else None
+                    noise_db = 10 * np.log10(total_power + 1e-12) if total_power else None
+                    anomalies = self.cycle_anomaly.record_cycle(
+                        total_power_db=noise_db,
+                        source_count=len(sources),
+                        bearing=self.aoa if self.aoa else None,
+                        active_detectors=sum(1 for s in sources if s.get('detector')))
+                    if anomalies:
+                        for a in anomalies[:3]:
+                            self.log.warning(f'ANOMALY: {a["metric"]} {a["direction"]} z={a["z_score"]:.1f} (val={a["value"]:.1f} vs mean={a["mean"]:.1f}+/-{a["std"]:.1f})')
+                except: pass
+
             # 10. WiFi AP scanning with LOCAL geolocation + CSI motion detection
             wigle_aps=[]
             aps = []  # initialize before try block — prevents NameError if scan fails
@@ -8777,6 +9897,10 @@ class TSCMSystem:
                 if aps:
                     # Feed approaching detector
                     self.detectors['wifi_approaching'].update(aps)
+                    # WiFi video surveillance: find strong/hidden APs that could relay video
+                    self.wifi_video.update(aps)
+                    # Mesh network detection
+                    self.mesh_detector.update(aps)
                     # CSI analysis: motion/presence/jamming
                     csi_dets = self.wifi_csi.scan_csi(aps)
                     for cd in csi_dets:
@@ -9357,6 +10481,21 @@ class TSCMSystem:
                             'hackrf_aoa':hackrf_aoa if 'hackrf_aoa' in dir() else 0},
                 'sources':clean_sources,
                 'threat_labels':Config.MAP_THREAT_LABELS,
+                'threat_summary':self.threat_engine.get_threat_summary(),
+                'top_threats':self.threat_engine.get_top_threats(10),
+                'noise_floors':{k: self.noise_cal.get_floor(k) for k in self.noise_cal.calibrated_floors},
+                'adaptive_sweep':{b[0]: self.adaptive_sweep.get_dwell_multiplier(b[0]) for b in HACKRF_SWEEP},
+                'blind_spots':self.blind_spot.get_coverage_report(),
+                'modulation_fps':self.mod_fingerprinter.get_fingerprint_summary(),
+                'recent_anomalies':self.cycle_anomaly.get_recent_anomalies(10),
+                'source_lifecycles':{str(k): v for k, v in list(self.source_lifecycle.get_all_lifecycles().items())[-20:]},
+                'cooccurrence_clusters':self.cooccurrence.get_cluster_report(),
+                'video_status':self.video_demod.get_status(),
+                'wifi_video_aps':self.wifi_video.get_suspicious_aps(),
+                'mesh_clusters':self.mesh_detector.get_report(),
+                'attack_profile':self.sigint.get_profile(),
+                'bearing_heatmap':self.bearing_heatmap.get_heatmap_data(),
+                'hot_bearings':self.bearing_heatmap.get_hot_bearings(10),
                 'watcher_findings': [{'type': f.get('type','?'), 'info': f.get('info','')[:100]}
                                 for f in list(self.watcher.findings)[-5:]],
                 'wifi_aps':wigle_aps,
@@ -9374,6 +10513,8 @@ class TSCMSystem:
             pet_khz=self.petterson.fs//1000
             bands=self.petterson.get_band_info()
             band_str=f"384k:{bands.get('384k',0)//1000}k 48k:{bands.get('48k',0)//1000}k 2k:{bands.get('2k',0)//1000}"
+            # Update adaptive sweep priority
+            self.adaptive_sweep.update(self.cycle_count)
             # Sweep SDR frequencies across full spectrum
             (h_name, h_freq, h_rate), (b_name, b_freq, b_rate) = self.sweep.step()
 
@@ -9420,6 +10561,14 @@ class TSCMSystem:
                   f"GPS:{'FIX' if gps['has_fix'] else 'NO FIX'} | "
                   f"H:{h_name}({h_freq/1e6:.0f}M) B:{b_name}({b_freq/1e6:.0f}M) | "
                   f"Bands:{band_str} | "
+                  f"Threats:{self.threat_engine.get_threat_summary().get('CRITICAL',0)}C {self.threat_engine.get_threat_summary().get('HIGH',0)}H | "
+                  f"Blind:{self.blind_spot.get_coverage_report()['bands_gapped']}g | "
+                  f"Anomalies:{len(self.cycle_anomaly.get_recent_anomalies(5))} | "
+                  f"Mod:{len(self.mod_fingerprinter.known_fingerprints)}fps | "
+                  f"Clusters:{self.cooccurrence.get_cluster_report()['total_clusters']} | "
+                  f"Video:{self.video_demod.frame_count}fr | "
+                  f"Mesh:{len(self.mesh_detector.mesh_clusters)} | "
+                  f"Sigint:{sum(1 for v in self.sigint.attack_profile.values() if v)}/{len(self.sigint.attack_profile)} | "
                   f"Intent:{intent}",end='\r')
             # System health heartbeat every 20 cycles
             if self.cycle_count % 20 == 0:
