@@ -10247,7 +10247,7 @@ class TSCMSystem:
             except: pass
 
             # 9b. Power line envelope check (every 30 cycles)
-            if cycle_count % 30 == 0 and hasattr(self, 'mic_audio') and self.mic_audio is not None:
+            if self.cycle_count % 30 == 0 and hasattr(self, 'mic_audio') and self.mic_audio is not None:
                 try:
                     env_result = self.pl_envelope.check(self.mic_audio)
                     if env_result and env_result['mod_strength'] > 0.3:
