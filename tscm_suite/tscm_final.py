@@ -6245,14 +6245,152 @@ HACKRF_SWEEP = [
     ('UHF', 450e6, 20e6, 1),       # UHF direct capture (base)
     ('ISM900', 915e6, 20e6, 3),     # ISM 900 MHz
     ('CELL', 850e6, 20e6, 3),     # Cellular band
+    ('L_BAND', 1575e6, 20e6, 5),   # L-band 1.575 GHz - GPS/satellite comms/military
     ('C', 5800e6, 20e6, 5),       # 5.8 GHz ISM
+    ('X_BAND', 10500e6, 20e6, 8), # X-band 10.5 GHz - radar/satellite downlink
+    ('K_BAND', 24000e6, 20e6, 10), # K-band 24 GHz - radar/motion sensors
 ]
 BLADERF_SWEEP = [
     ('S_BASE', 2400e6, 10e6, 1),   # base: MIMO AoA at 2.4 GHz
-#     ('MW_CARRIER', 2450e6, 10e6, 50),  # MW voice carrier capture - AM demod for SSTV/video/voice
     ('C_BAND', 5800e6, 20e6, 25),  # 5.8 GHz - WiFi 5/6, eCPRI, drone
     ('VHF_LOW', 50e6, 10e6, 30),   # 50 MHz - power line harmonics, HF/VHF bridge
+    ('CBRS', 3550e6, 20e6, 20),    # 3.5 GHz CBRS - C2 channel candidate
+    ('L_HIGH', 1600e6, 20e6, 20),  # 1.6 GHz L-band upper - satcom/military
 ]
+
+class CoordinatedSystemDetector:
+    """Detect multi-transmitter coordinated attack system.
+    
+    Monitors carrier activity across all sweep bands to find:
+    1. Simultaneous carrier appearance/disappearance (switched together)
+    2. Harmonic relationships (same transmitter, different bands)
+    3. Correlated SNR modulation (same source power variation)
+    4. C2 polling patterns (periodic activation)
+    
+    A single adversary system with backup transmitters will show coordinated
+    behavior: when one transmitter key-down, another key-up, or when they all
+    modulate in sync (shared power supply coupling).
+    """
+    def __init__(self):
+        self.band_activity = {}  # band_name -> [(timestamp, carrier_count, max_snr, total_power)]
+        self.coordinated_pairs = []  # [(band_a, band_b, correlation, confidence)]
+        self.c2_windows = []  # [(start_time, end_time, active_bands)]
+        self.band_windows = {}  # band -> deque of (start, end) active windows
+        from collections import deque
+        self.max_history = 300
+        self.analysis_interval = 10  # run analysis every N observations
+        self.obs_count = 0
+    
+    def observe(self, band_name, timestamp, carrier_count, max_snr, total_power):
+        """Record band activity at this sweep cycle."""
+        if band_name not in self.band_activity:
+            self.band_activity[band_name] = deque(maxlen=self.max_history)
+        self.band_activity[band_name].append((timestamp, carrier_count, max_snr, total_power))
+        self.obs_count += 1
+    
+    def analyze(self, now):
+        """Run coordinated system analysis. Returns list of findings."""
+        if self.obs_count < self.analysis_interval:
+            return []
+        self.obs_count = 0
+        
+        findings = []
+        bands = list(self.band_activity.keys())
+        if len(bands) < 2:
+            return findings
+        
+        # 1. Simultaneous activity check: do carriers appear/disappear together?
+        for i in range(len(bands)):
+            for j in range(i+1, len(bands)):
+                ba = bands[i]; bb = bands[j]
+                hist_a = list(self.band_activity.get(ba, []))
+                hist_b = list(self.band_activity.get(bb, []))
+                if len(hist_a) < 10 or len(hist_b) < 10:
+                    continue
+                # Binary presence: 1 if carriers detected, 0 if not
+                presence_a = [1 if h[1] > 0 else 0 for h in hist_a[-50:]]
+                presence_b = [1 if h[1] > 0 else 0 for h in hist_b[-50:]]
+                min_len = min(len(presence_a), len(presence_b))
+                presence_a = presence_a[-min_len:]
+                presence_b = presence_b[-min_len:]
+                if min_len < 10:
+                    continue
+                # Jaccard correlation: how often do they co-occur?
+                both_active = sum(1 for a, b in zip(presence_a, presence_b) if a == 1 and b == 1)
+                both_inactive = sum(1 for a, b in zip(presence_a, presence_b) if a == 0 and b == 0)
+                total = min_len
+                agreement = (both_active + both_inactive) / total if total > 0 else 0
+                if agreement > 0.85 and both_active > 3:
+                    findings.append({
+                        'type': 'coordinated_pair',
+                        'bands': (ba, bb),
+                        'agreement': round(agreement, 3),
+                        'co_occurrences': both_active,
+                        'confidence': 'HIGH' if agreement > 0.95 else 'MEDIUM'
+                    })
+                # 2. SNR correlation: do signal strengths track together?
+                snr_a = [h[2] for h in hist_a[-50:]]
+                snr_b = [h[2] for h in hist_b[-50:]]
+                min_snr = min(len(snr_a), len(snr_b))
+                snr_a = np.array(snr_a[-min_snr:])
+                snr_b = np.array(snr_b[-min_snr:])
+                if min_snr >= 10 and np.std(snr_a) > 0.1 and np.std(snr_b) > 0.1:
+                    corr = np.corrcoef(snr_a, snr_b)[0, 1]
+                    if not np.isnan(corr) and abs(corr) > 0.7:
+                        findings.append({
+                            'type': 'snr_correlated',
+                            'bands': (ba, bb),
+                            'correlation': round(float(corr), 3),
+                            'corr_type': 'positive' if corr > 0 else 'negative',
+                            'confidence': 'HIGH' if abs(corr) > 0.9 else 'MEDIUM'
+                        })
+        
+        # 3. C2 polling detection: periodic activation pattern
+        for band, hist in self.band_activity.items():
+            timestamps = [h[0] for h in list(hist)[-100:]]
+            presences = [1 if h[1] > 0 else 0 for h in list(hist)[-100:]]
+            if len(presences) < 20:
+                continue
+            # Find transitions: off->on
+                transitions = [i for i in range(1, len(presences)) 
+                             if presences[i] == 1 and presences[i-1] == 0]
+                if len(transitions) >= 3:
+                    intervals = [timestamps[t] - timestamps[t-1] for t in transitions[1:]]
+                    if len(intervals) >= 2:
+                        mean_interval = np.mean(intervals)
+                        cv = np.std(intervals) / mean_interval if mean_interval > 0 else 999
+                        if cv < 0.3 and mean_interval > 5:  # regular polling
+                            findings.append({
+                                'type': 'c2_polling',
+                                'band': band,
+                                'interval_s': round(float(mean_interval), 1),
+                                'cv': round(float(cv), 3),
+                                'transitions': len(transitions),
+                                'confidence': 'HIGH' if cv < 0.1 else 'MEDIUM'
+                            })
+        
+        # 4. Total active band count: how many bands are active simultaneously?
+        all_timestamps = set()
+        for hist in self.band_activity.values():
+            for h in list(hist)[-50:]:
+                all_timestamps.add(h[0])
+        if len(all_timestamps) > 10:
+            ts_sorted = sorted(all_timestamps)
+            max_simultaneous = 0
+            for ts in ts_sorted[-30:]:
+                active = sum(1 for hist in self.band_activity.values() 
+                           if any(abs(h[0]-ts) < 60 and h[1] > 0 for h in list(hist)[-50:]))
+                max_simultaneous = max(max_simultaneous, active)
+            if max_simultaneous >= 3:
+                findings.append({
+                    'type': 'wideband_system',
+                    'max_simultaneous_bands': max_simultaneous,
+                    'total_bands_scanned': len(bands),
+                    'confidence': 'CRITICAL' if max_simultaneous >= 5 else 'HIGH'
+                })
+        
+        return findings
+
 
 class PowerLineHarmonicDetector:
     """Detect power line carrier signals and harmonics.
@@ -8247,6 +8385,7 @@ class TSCMSystem:
         self.fhss_tracker = FrequencyHoppingTracker(max_window_s=180, min_freq_stops=3)
         self.adaptive_sweep = AdaptiveSweepPrioritizer(HACKRF_SWEEP, BLADERF_SWEEP)
         self.threat_engine = ThreatScoringEngine()
+        self.coordinated = CoordinatedSystemDetector()
         self.noise_cal = NoiseFloorCalibrator(window_size=50)
         # Blind spot analysis: find bands with no detections (coverage gaps)
         all_bands = list(HACKRF_SWEEP) + list(BLADERF_SWEEP)
@@ -10560,6 +10699,52 @@ class TSCMSystem:
                     self.log.warning(f'THREAT: {threat_counts} | top={top_threats[0]["current_score"]:.0f}/100 ({top_threats[0]["fingerprint"][:30]})')
             except: pass
 
+            # Coordinated system detection: feed band activity and analyze
+            try:
+                # Count carriers detected on current HackRF band
+                h_carriers = len([s for s in sources.values() 
+                    if s.get('detector','').startswith('hackrf') and 
+                    abs(s.get('freq',0) - self._last_hfreq) < 20e6 and s.get('freq',0) > 1e6])
+                h_max_snr = max([s.get('snr',0) for s in sources.values() 
+                    if s.get('detector','').startswith('hackrf')], default=0)
+                h_total_power = sum([s.get('snr',0) for s in sources.values() 
+                    if s.get('detector','').startswith('hackrf')])
+                h_name = getattr(self, '_current_hband_name', 'UHF')
+                self.coordinated.observe(h_name, now, h_carriers, h_max_snr, h_total_power)
+                # Count carriers on BladeRF band
+                b_carriers = len([s for s in sources.values() 
+                    if not s.get('detector','').startswith('hackrf') and 
+                    s.get('freq',0) > 1e6])
+                b_max_snr = max([s.get('snr',0) for s in sources.values() 
+                    if not s.get('detector','').startswith('hackrf') and s.get('freq',0) > 1e6], default=0)
+                b_total_power = sum([s.get('snr',0) for s in sources.values() 
+                    if not s.get('detector','').startswith('hackrf') and s.get('freq',0) > 1e6])
+                b_name = getattr(self, '_current_bband_name', 'S_BASE')
+                self.coordinated.observe(b_name, now, b_carriers, b_max_snr, b_total_power)
+                # Run analysis every few cycles
+                findings = self.coordinated.analyze(now)
+                for f in findings:
+                    if f['type'] == 'coordinated_pair':
+                        self.log.warning(f"COORDINATED PAIR: {f['bands'][0]}+{f['bands'][1]} agreement={f['agreement']} co-occur={f['co_occurrences']}x [{f['confidence']}]")
+                        self.localization.add_observation(
+                            fingerprint=f"coord_{f['bands'][0]}_{f['bands'][1]}".encode(),
+                            obs_lat=lat, obs_lon=lon, bearing_deg=None, range_m=None,
+                            freq=0, classification='transmitter',
+                            detector_name='coordinated_system', snr=float(f['agreement']*100))
+                    elif f['type'] == 'snr_correlated':
+                        self.log.warning(f"SNR CORRELATED: {f['bands'][0]}+{f['bands'][1]} r={f['correlation']} ({f['corr_type']}) [{f['confidence']}]")
+                    elif f['type'] == 'c2_polling':
+                        self.log.warning(f"C2 POLLING: {f['band']} interval={f['interval_s']}s cv={f['cv']} [{f['confidence']}]")
+                        self.localization.add_observation(
+                            fingerprint=f"c2_poll_{f['band']}".encode(),
+                            obs_lat=lat, obs_lon=lon, bearing_deg=None, range_m=None,
+                            freq=0, classification='transmitter',
+                            detector_name='coordinated_c2', snr=float(f['interval_s']))
+                    elif f['type'] == 'wideband_system':
+                        self.log.warning(f"WIDEBAND SYSTEM: {f['max_simultaneous_bands']}/{f['total_bands_scanned']} bands active [{f['confidence']}]")
+            except Exception as e:
+                self.log.debug(f'Coordinated detect error: {e}')
+
             # Update source lifecycle (bearing stability, active time) and co-occurrence
             try:
                 cycle_fps = []
@@ -11433,6 +11618,8 @@ class TSCMSystem:
             self.adaptive_sweep.update(self.cycle_count)
             # Sweep SDR frequencies across full spectrum
             (h_name, h_freq, h_rate), (b_name, b_freq, b_rate) = self.sweep.step()
+            self._current_hband_name = h_name
+            self._current_bband_name = b_name
 
             # Retune HackRF if band changed
             if getattr(self, '_last_hfreq', 0) != h_freq:
@@ -11497,6 +11684,7 @@ class TSCMSystem:
                   f"Mesh:{len(self.mesh_detector.mesh_clusters)} | "
                   f"Sigint:{sum(1 for v in self.sigint.attack_profile.values() if v)}/{len(self.sigint.attack_profile)} | "
                   f"SSTV:{self.sstv.sync_pulse_count}sync/{self.sstv.frame_count}fr | "
+                  f"Coord:{len(self.coordinated.coordinated_pairs)}pairs | "
                   f"Intent:{intent}",end='\r')
             # System health heartbeat every 20 cycles
             if self.cycle_count % 20 == 0:
