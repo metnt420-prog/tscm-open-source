@@ -917,6 +917,17 @@ class SourceLocalizationEngine:
                     intersections = []
                     for b_obs in bladerf_bearings[-8:]:
                         for h_obs in hackrf_bearings[-8:]:
+                            # Frequency correlation guard: only intersect bearings when
+                            # the signals are likely from the same physical source.
+                            # Allow: same frequency ±10%, harmonics (2x, 3x), or sub-harmonics.
+                            b_freq = b_obs.get('freq', 0)
+                            h_freq = h_obs.get('freq', 0)
+                            if b_freq > 0 and h_freq > 0:
+                                ratio = max(b_freq, h_freq) / (min(b_freq, h_freq) + 1e-6)
+                                is_harmonic = (abs(ratio - round(ratio)) < 0.15 and 0.5 <= round(ratio) <= 10)
+                                is_same_band = abs(b_freq - h_freq) / max(b_freq, h_freq) < 0.10
+                                if not (is_same_band or is_harmonic):
+                                    continue  # unrelated frequencies — skip to prevent phantom intersections
                             pt = self._intersect_bearings(
                                 b_obs['lat'], b_obs['lon'], b_obs['bearing'],
                                 h_obs['lat'], h_obs['lon'], h_obs['bearing'])
@@ -8422,44 +8433,75 @@ class TSCMSystem:
             aoa = (aoa + Config.BEARING_OFFSET + 360) % 360
             if aoa > 180: aoa -= 360  # normalize to -180..+180
 
-            # 180deg  ambiguity resolution: compare power on both antennas
-            # The antenna closer to the source receives more power
+            # 180deg ambiguity resolution: three methods, cascading
+            # Method 1: Power ratio (antenna closer to source gets more signal)
             p1 = np.sqrt(np.mean(np.abs(iq1_c)**2))
             p2 = np.sqrt(np.mean(np.abs(iq2_c)**2))
             power_ratio = p1 / (p2 + 1e-12)
+
+            # Phase sign: positive phase_diff means ch2 signal arrives AFTER ch1
+            # (plane wave from ch1 side → ch2 first). Negative = ch2 side.
+            # This resolves ambiguity when power ratio is inconclusive.
+            phase_sign = 1 if phase_diff >= 0 else -1
+
+            # Array axis: BEARING_OFFSET is where antennas point (broadside)
+            # Phase sign + 1 → source is on the positive-rotation side of array axis
+            # Phase sign - 1 → source is on the negative-rotation side
+            # For the BladeRF xA9: antenna 1 (RX1) is at +d, antenna 2 (RX2) at -d
+            # along the array axis. Positive phase_diff = signal arrives at RX2 first
+            # → source is on RX2 side → clockwise from array axis.
 
             # Alternate bearing (180deg  opposite)
             aoa_alt = (aoa + 180 + 360) % 360
             if aoa_alt > 180: aoa_alt -= 360
 
-            # Resolve ambiguity: stronger channel = source on that side of array axis
-            # ch1 stronger → source is on the rx1 side of the array
-            # ch2 stronger → source is on the rx2 side of the array
-            # Array axis determines which bearings are on which side
-            if power_ratio > 1.15:  # ch1 > ch2 by 15%+ → source on rx1 side
-                # rx1 side = counterclockwise from array axis
+            # Resolve ambiguity: power ratio (primary), phase sign (secondary), history (tertiary)
+            if power_ratio > 1.15:
                 side1 = (Config.ARRAY_AXIS_DEGREES - 90 + 360) % 360
                 if side1 > 180: side1 -= 360
-                # Pick the bearing closer to the rx1 side
                 if abs(((aoa - side1 + 180) % 360) - 180) < abs(((aoa_alt - side1 + 180) % 360) - 180):
                     resolved = aoa
                 else:
                     resolved = aoa_alt
-                self.log.info(f"AoA RESOLVED: {aoa:.1f}→{resolved:.1f}deg (ch1 stronger, p1/p2={power_ratio:.2f})")
+                self.log.info(f"AoA RESOLVED(power): {aoa:.1f}→{resolved:.1f}deg (ch1 stronger, p1/p2={power_ratio:.2f})")
                 aoa = resolved
-            elif power_ratio < 0.87:  # ch2 > ch1 by 15%+ → source on rx2 side
-                # rx2 side = clockwise from array axis
+            elif power_ratio < 0.87:
                 side2 = (Config.ARRAY_AXIS_DEGREES + 90 + 360) % 360
                 if side2 > 180: side2 -= 360
-                # Pick the bearing closer to the rx2 side
                 if abs(((aoa - side2 + 180) % 360) - 180) < abs(((aoa_alt - side2 + 180) % 360) - 180):
                     resolved = aoa
                 else:
                     resolved = aoa_alt
-                self.log.info(f"AoA RESOLVED: {aoa:.1f}→{resolved:.1f}deg (ch2 stronger, p1/p2={power_ratio:.2f})")
+                self.log.info(f"AoA RESOLVED(power): {aoa:.1f}→{resolved:.1f}deg (ch2 stronger, p1/p2={power_ratio:.2f})")
                 aoa = resolved
             else:
-                self.log.info(f"AoA AMBIGUOUS: {aoa:.1f}deg alt={aoa_alt:.1f}deg (p1/p2={power_ratio:.2f})")
+                # Power ambiguous (p1/p2 ~ 1.0) — try phase sign and history
+                hist_aoa = self.stable_aoa if hasattr(self, 'stable_aoa') and self.stable_aoa != 0.0 else None
+                if hist_aoa is not None:
+                    # Prefer bearing closer to recent history (temporal consistency)
+                    d1 = abs(((aoa - hist_aoa + 180) % 360) - 180)
+                    d2 = abs(((aoa_alt - hist_aoa + 180) % 360) - 180)
+                    if d2 < d1:
+                        resolved = aoa_alt
+                        self.log.info(f"AoA RESOLVED(history): {aoa:.1f}→{resolved:.1f}deg (hist={hist_aoa:.1f}deg)")
+                        aoa = resolved
+                    else:
+                        self.log.info(f"AoA RESOLVED(history): kept {aoa:.1f}deg (hist={hist_aoa:.1f}deg)")
+                elif coherence > 0.2:
+                    # Use phase sign: positive phase → RX2 leads → source on RX1 side
+                    if phase_diff > 0:
+                        side = (Config.ARRAY_AXIS_DEGREES - 90 + 360) % 360
+                    else:
+                        side = (Config.ARRAY_AXIS_DEGREES + 90 + 360) % 360
+                    if side > 180: side -= 360
+                    if abs(((aoa - side + 180) % 360) - 180) < abs(((aoa_alt - side + 180) % 360) - 180):
+                        resolved = aoa
+                    else:
+                        resolved = aoa_alt
+                    self.log.info(f"AoA RESOLVED(phase): {aoa:.1f}→{resolved:.1f}deg (phase={np.degrees(phase_diff):.1f}deg coh={coherence:.3f})")
+                    aoa = resolved
+                else:
+                    self.log.info(f"AoA AMBIGUOUS: {aoa:.1f}deg alt={aoa_alt:.1f}deg (p1/p2={power_ratio:.2f}, coh={coherence:.3f})")
 
             if aoa != 0.0:
                 self.log.info(f"AoA: {aoa:.1f}deg (alt={aoa_alt:.1f}deg) coh={coherence:.3f} phase={np.degrees(phase_diff):.1f}deg p1/p2={power_ratio:.2f}")
@@ -8502,9 +8544,37 @@ class TSCMSystem:
         stable = math.degrees(math.atan2(y_w, x_w))
 
         # Resultant length - how clustered (1=same dir, 0=random)
+        # Handle 180deg ambiguity: if two bearings differ by ~180deg,
+        # they're the same source just flipped. Unify by picking the cluster center.
         x_sum = sum(math.cos(math.radians(b)) for b in h_bearings)
         y_sum = sum(math.sin(math.radians(b)) for b in h_bearings)
         r_len = math.sqrt(x_sum**2 + y_sum**2) / len(h_bearings)
+
+        # Check if the cluster is actually two groups ~180deg apart (ambiguity flip)
+        # If so, pick the larger cluster and use only those bearings
+        if r_len < 0.3 and len(h_bearings) >= 4:
+            # Split bearings into two hemispheres around the mean
+            ref_angle = stable
+            group_a = []
+            group_b = []
+            for b, c in h_bearings:
+                diff = ((b - ref_angle + 180) % 360) - 180
+                if abs(diff) <= 90:
+                    group_a.append((b, c))
+                else:
+                    group_b.append((b, c))
+            # Pick the group with more observations
+            use_group = group_a if len(group_a) >= len(group_b) else group_b
+            if len(use_group) >= 2:
+                u_bearings = [b for b, _ in use_group]
+                u_weights = [c for _, c in use_group]
+                x_w2 = sum(c * math.cos(math.radians(b)) for b, c in zip(u_bearings, u_weights))
+                y_w2 = sum(c * math.sin(math.radians(b)) for b, c in zip(u_bearings, u_weights))
+                stable = math.degrees(math.atan2(y_w2, x_w2))
+                x_s2 = sum(math.cos(math.radians(b)) for b in u_bearings)
+                y_s2 = sum(math.sin(math.radians(b)) for b in u_bearings)
+                r_len = math.sqrt(x_s2**2 + y_s2**2) / len(u_bearings)
+                self.log.info(f"AoA CLUSTER: picked group of {len(use_group)}/{len(h_bearings)}, r={r_len:.2f}")
 
         if r_len < 0.3:
             self.log.info(f"AoA SCATTERED: r={r_len:.2f} - reflections dominating, low confidence")
