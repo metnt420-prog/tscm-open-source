@@ -21,7 +21,7 @@ Hardware: BladeRF xA9 MIMO, HackRF+SpyVerter, Petterson mic, laptop mic,
 Run as Administrator on Windows 11.
 """
 
-import sys, os, time, json, threading, queue, struct, hashlib, pickle
+import sys, os, time, json, threading, queue, struct, hashlib, pickle, wave
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import subprocess, socket, webbrowser, ctypes, tempfile, math, re
 import numpy as np  # global numpy import — used throughout
@@ -38,7 +38,6 @@ if sys.platform == 'win32':
         sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     except:
         pass
-import numpy as np
 import scipy.signal
 from scipy.signal import (hilbert, find_peaks, periodogram, welch, butter, lfilter,
                           spectrogram, resample)
@@ -1487,10 +1486,10 @@ class Victim2kDetector:
         # Save V2K audio clip
         if results and len(self.buf_48k) > 16000:
             try:
-                import wave, os, time as _time
+                import os, time  # wave, os, time from global imports
                 clip_dir = os.path.join(os.path.dirname(__file__), 'voice_clips')
                 os.makedirs(clip_dir, exist_ok=True)
-                ts = _time.strftime('%Y%m%d_%H%M%S')
+                ts = time.strftime('%Y%m%d_%H%M%S')
                 pcm_data = np.array(list(self.buf_48k))[-48000:]  # last 1 second at 48kHz
                 wav_path = os.path.join(clip_dir, f'v2k_{ts}_{results[0]["freq"]:.0f}hz.wav')
                 with wave.open(wav_path, 'w') as wf:
@@ -4182,9 +4181,9 @@ class BladeRFCLIBridge:
     6. Rogue process detection - continuous monitoring for unauthorized bladeRF-cli
     7. USB device serial - binds to specific device, flags if device changes
     """
-    # Expected capture: n=8192 MIMO samples (2ch × I,Q × 2 bytes int16 = 32768 bytes)
-    # bladeRF-cli n=8192 means 8192 total sample pairs for MIMO
-    EXPECTED_BYTES = 32768  # n=8192 total samples * 2(I/Q) * 2bytes = 32768
+    # Expected capture: n=1048576 MIMO samples (2ch × I,Q × 2 bytes int16 = 4194304 bytes)
+    # bladeRF-cli n=1048576 means ~104ms at 10MHz - enough for SSTV frames
+    EXPECTED_BYTES = 4194304  # n=1048576 total samples * 2(I/Q) * 2bytes
 
     def __init__(self, freq, sample_rate, gain, bias_tee=True):
         self.freq=int(freq);self.sample_rate=int(sample_rate);self.gain=gain
@@ -4411,7 +4410,7 @@ class BladeRFCLIBridge:
                                 f"set gain rx2 {self.gain}\n"
                                 f"set biastee rx1 on\n"
                                 f"set biastee rx2 on\n"
-                                f"rx config file={tmpname} format=bin n=8192\n"
+                                f"rx config file={tmpname} format=bin n=1048576\n"
                                 f"rx start\nrx wait 3000\n")
                     with open(scriptfile, 'w') as f:
                         f.write(cmd_script)
@@ -5776,7 +5775,6 @@ class BladeRFTXBridge:
         try:
             self.tx_freq = freq_hz; self.tx_gain = gain
             # Generate CW IQ samples: I=max, Q=0 at requested rate
-            import numpy as np
             nsamples = 16384  # enough for ~3ms at 5MSps
             iq_i = np.ones(nsamples, dtype=np.int16) * 2047  # -6dBFS safe
             iq_q = np.zeros(nsamples, dtype=np.int16)
@@ -6229,17 +6227,18 @@ class NeuralDetector:
 # ===================== FREQUENCY SWEEP =====================
 
 HACKRF_SWEEP = [
-    ('VLF', 100e3, 10e6, 12),       # VLF 100 kHz - power line harmonics, submarine comms
-    ('HF', 15e6, 10e6, 15),         # HF 15 MHz - shortwave, over-the-horizon
-    ('VHF', 150e6, 20e6, 10),      # VHF band - airband, pager, two-way radio
+    ('S', 2450e6, 20e6, 3),        # 2.45 GHz MW carrier - PRIMARY THREAT, check frequently
+    ('VLF', 100e3, 10e6, 3),       # VLF 100 kHz - power line harmonics
+    ('HF', 15e6, 10e6, 5),         # HF 15 MHz - shortwave
+    ('VHF', 150e6, 20e6, 3),      # VHF band
     ('UHF', 450e6, 20e6, 1),       # UHF direct capture (base)
-    ('ISM900', 915e6, 20e6, 8),     # ISM 900 MHz - ZigBee, FHSS, IoT C2
-    ('CELL', 850e6, 20e6, 12),     # Cellular band (replaces dead RTL-SDR)
-    ('S', 2450e6, 20e6, 15),       # sweep to 2.45 GHz every 15 cycles to check MW carrier
-    ('C', 5800e6, 20e6, 20),       # 5.8 GHz ISM / eCPRI fronthaul
+    ('ISM900', 915e6, 20e6, 3),     # ISM 900 MHz
+    ('CELL', 850e6, 20e6, 3),     # Cellular band
+    ('C', 5800e6, 20e6, 5),       # 5.8 GHz ISM
 ]
 BLADERF_SWEEP = [
     ('S_BASE', 2400e6, 10e6, 1),   # base: MIMO AoA at 2.4 GHz
+#     ('MW_CARRIER', 2450e6, 10e6, 50),  # MW voice carrier capture - AM demod for SSTV/video/voice
     ('C_BAND', 5800e6, 20e6, 25),  # 5.8 GHz - WiFi 5/6, eCPRI, drone
     ('VHF_LOW', 50e6, 10e6, 30),   # 50 MHz - power line harmonics, HF/VHF bridge
 ]
@@ -6260,8 +6259,7 @@ class PowerLineHarmonicDetector:
         Returns list of detected harmonic frequencies."""
         if iq_data is None or len(iq_data) < 4096:
             return []
-        import numpy as np
-        from scipy.signal import find_peaks
+        # numpy and find_peaks available from global imports
         fft_mag = np.abs(np.fft.rfft(iq_data[-8192:].astype(np.complex128)))
         freqs = np.fft.rfftfreq(len(iq_data[-8192:]), 1.0/self.fs) + center_freq
         noise = np.median(fft_mag) + 1e-12
@@ -6391,7 +6389,6 @@ class SignalActivityTracker:
 
     def get_active_bands(self, threshold_pct=70):
         """Return bands with unusual activity (above threshold percentile)."""
-        import numpy as np
         results = []
         for band_key, hist in self.bands.items():
             if len(hist) < 10:
@@ -6440,7 +6437,6 @@ class TemporalPatternDetector:
 
     def detect_patterns(self):
         """Scan all tracked sources for periodic patterns."""
-        import numpy as np
         results = []
         stale_keys = []
         import time as _t
@@ -6616,7 +6612,6 @@ class SignalStrengthDelta:
 
     def get_trends(self):
         """Return bands with significant power trends."""
-        import numpy as np
         results = []
         stale = []
         import time as _t
@@ -6893,7 +6888,6 @@ class ModulationFingerprinter:
 
     def classify_iq(self, iq_data, freq_center=None):
         """Classify modulation from complex IQ samples. Returns modulation type + confidence."""
-        import numpy as np
         if len(iq_data) < 256:
             return None
         samples = np.array(iq_data[:4096], dtype=np.complex64)
@@ -6994,7 +6988,6 @@ class CycleAnomalyDetector:
     def record_cycle(self, total_power_db=None, source_count=None, bearing=None,
                      noise_floor_db=None, active_detectors=None, voice_events=0):
         """Record metrics from the current cycle. Returns list of anomalies."""
-        import numpy as np
         metrics = {
             'total_power_db': total_power_db,
             'source_count': source_count,
@@ -7202,7 +7195,6 @@ class AnalogVideoDemodulator:
 
     def detect_video_carrier(self, iq_data, center_freq):
         """Detect wideband AM carriers characteristic of analog video (6MHz wide)."""
-        import numpy as np
         if len(iq_data) < 2048:
             return None
         samples = np.array(iq_data, dtype=np.complex64)
@@ -7263,7 +7255,6 @@ class AnalogVideoDemodulator:
 
     def demodulate_frame(self, iq_data, carrier_offset_hz):
         """Demodulate AM video from IQ data. Returns a PIL Image or None."""
-        import numpy as np
         try:
             samples = np.array(iq_data[:65536], dtype=np.complex64)
             if len(samples) < 4096:
@@ -7589,12 +7580,36 @@ class SSTVDemodulator:
         self.max_samples = int(self.sample_rate * self.buffer_seconds)
         self.audio_buffer = deque(maxlen=self.max_samples)
         self.scan_offset = 0  # track how far we've scanned in the buffer
+        self._envelope_norm = True  # normalize 60Hz envelope before demod
+
+    def _normalize_envelope(self, audio):
+        """Remove 60Hz power line amplitude modulation via Hilbert envelope."""
+        try:
+            from scipy.signal import hilbert
+            env = np.abs(hilbert(audio))
+            k = max(1, int(self.sample_rate * 0.005))
+            if k % 2 == 0: k += 1
+            kernel = np.ones(k) / k
+            env_smooth = np.convolve(env, kernel, mode='same')
+            env_safe = np.maximum(env_smooth, 0.001)
+            normed = audio / env_safe
+            rms_orig = np.sqrt(np.mean(audio**2))
+            rms_norm = np.sqrt(np.mean(normed**2))
+            if rms_norm > 0:
+                normed = normed * (rms_orig / rms_norm)
+            self._env_applied = True
+            return normed
+        except:
+            self._env_applied = False
+            return audio
 
     def feed(self, audio_data):
         """Accumulate audio into ring buffer. Called every cycle."""
         try:
             flat = np.asarray(audio_data).flatten().astype(np.float64)
             if len(flat) > 0:
+                if self._envelope_norm:
+                    flat = self._normalize_envelope(flat)
                 self.audio_buffer.extend(flat.tolist())
                 self._feed_count = getattr(self, '_feed_count', 0) + 1
         except:
@@ -7602,7 +7617,6 @@ class SSTVDemodulator:
 
     def scan_buffer(self):
         """Scan accumulated buffer for complete SSTV frame. Returns frame info or None."""
-        import numpy as np
         audio = np.array(self.audio_buffer)
         if len(audio) < self.sample_rate:  # need at least 1 second
             return None
@@ -7610,7 +7624,6 @@ class SSTVDemodulator:
 
     def _demodulate(self, audio, sample_rate):
         """Full SSTV demodulation from accumulated audio."""
-        import numpy as np
         fft_size = 1024
         hop = 256
         n_frames = len(audio) // hop
@@ -7990,16 +8003,70 @@ class VideoVoiceCorrelator:
         }
 
 
+class PowerLineEnvelopeDetector:
+    """Detects 60Hz power line amplitude modulation on audio signals.
+    Confirms whether an adversary is using AC-synced transmission to hide
+    signals within the power line noise floor. Measures envelope spectrum
+    for 60Hz/120Hz/180Hz harmonics.
+    """
+    def __init__(self, sr=48000, line_freq=60, check_harmonics=20):
+        self.sr = sr
+        self.line_freq = line_freq
+        self.check_harmonics = check_harmonics
+        self.env_mod_db = {}
+        self.total_checks = 0
+        self.high_mod_count = 0
+
+    def check(self, audio_data):
+        """Analyze audio envelope for 60Hz harmonic modulation."""
+        try:
+            audio = np.asarray(audio_data).flatten().astype(np.float64)
+            if len(audio) < self.sr:  # need at least 1 second
+                return None
+            from scipy.signal import hilbert
+            env = np.abs(hilbert(audio[:self.sr * 10]))  # first 10 seconds
+            spec = np.abs(np.fft.rfft(env))
+            freqs = np.fft.rfftfreq(len(env), 1.0 / self.sr)
+            result = {'harmonics': {}, 'total_power': 0, 'mod_strength': 0}
+            total_harm_power = 0
+            for h in range(1, self.check_harmonics + 1):
+                f0 = self.line_freq * h
+                if f0 > self.sr / 2: break
+                idx = np.argmin(np.abs(freqs - f0))
+                db = 20 * np.log10(spec[idx] + 1e-10)
+                result['harmonics'][f"{f0}Hz"] = db
+                self.env_mod_db[f"{f0}Hz"] = db
+                total_harm_power += 10 ** (db / 10)
+            result['total_power'] = 20 * np.log10(total_harm_power + 1e-10)
+            result['mod_strength'] = min(1.0, total_harm_power / 1e6)
+            self.total_checks += 1
+            if result['mod_strength'] > 0.3:
+                self.high_mod_count += 1
+            return result
+        except:
+            return None
+
+    def get_status(self):
+        ratio = self.high_mod_count / max(1, self.total_checks)
+        return {
+            'total_checks': self.total_checks,
+            'high_mod_count': self.high_mod_count,
+            'mod_ratio': ratio,
+            'latest_db': dict(self.env_mod_db),
+            'assessment': 'CRITICAL' if ratio > 0.7 else 'HIGH' if ratio > 0.4 else 'MEDIUM' if ratio > 0.2 else 'LOW'
+        }
+
+
 class FreqSweep:
     def __init__(self):
         self.hbands=HACKRF_SWEEP;self.bbands=BLADERF_SWEEP
-        self.hi=0;self.bi=0;self.cyc=0  # reset indices for direct capture
+        self.hi=0;self.bi=0;self.hcyc=0;self.bcyc=0  # separate cycle counters per SDR
     def step(self):
-        self.cyc+=1
+        self.hcyc+=1; self.bcyc+=1
         hname,hfreq,hrate,hdwell=self.hbands[self.hi]
         bname,bfreq,brate,bdwell=self.bbands[self.bi]
-        if self.cyc>=hdwell:self.hi=(self.hi+1)%len(self.hbands);self.cyc=0
-        if self.cyc>=bdwell:self.bi=(self.bi+1)%len(self.bbands);self.cyc=0
+        if self.hcyc>=hdwell:self.hi=(self.hi+1)%len(self.hbands);self.hcyc=0
+        if self.bcyc>=bdwell:self.bi=(self.bi+1)%len(self.bbands);self.bcyc=0
         return self.hbands[self.hi][:3],self.bbands[self.bi][:3]
 
 class TSCMSystem:
@@ -8202,6 +8269,8 @@ class TSCMSystem:
         self.waterfall = SpectralWaterfallLogger()
         # WiFi client tracker: device join/leave surveillance detection
         self.wifi_tracker = WiFiClientTracker()
+        # Power line envelope detector: 60Hz AM modulation analysis
+        self.pl_envelope = PowerLineEnvelopeDetector()
         self.null_enabled = Config.ENABLE_NULL_STEERING
         if self.null_enabled:
             # TX bias tee: enable in the RX capture loop (same bladeRF session)
@@ -8930,6 +8999,101 @@ class TSCMSystem:
                         self.log.info(f'EVIDENCE snapshot {os.path.basename(snap_path)} hash={snap_hash[:16]}')
                     except Exception as e:
                         self.log.debug(f'Snapshot save error: {e}')
+
+                # === BLADERF RF-AM DEMOD at 2.45 GHz ===
+                _bf = getattr(self, '_last_bfreq', None)
+                self.log.warning(f'RF-AM pre: bfreq={_bf} cyc={self.cycle_count}')
+                # When BladeRF sweep hits MW_CARRIER band, AM-demod IQ for
+                # voice + SSTV + video composite signal extraction.
+                try:
+                    actual_bfreq = getattr(self, '_last_bfreq', None)
+                    self.log.warning(f'RF-AM(BR) check: bfreq={actual_bfreq} iq1={len(iq1) if iq1 is not None else -1} cyc={self.cycle_count}')
+                    if actual_bfreq is not None and abs(actual_bfreq - 2450e6) < 10e6 and iq1 is not None and len(iq1) >= 4096:
+                        self.log.info(f'RF-AM(BR) ENTER: iq1_type={type(iq1)} iq1_len={len(iq1)} iq1_rms={np.sqrt(np.mean(np.abs(iq1[:4096])**2)):.6f}')
+                        iq_c = iq1  # use ALL samples - 524K = 52ms at 10MHz
+                        # AM envelope detection: for complex IQ, envelope = |z|
+                        envelope = np.abs(iq_c)
+                        envelope -= np.mean(envelope)
+                        envelope = np.abs(envelope)
+                        env_max = np.max(np.abs(envelope))
+                        if env_max > 0: envelope = envelope / env_max
+                        # Narrowband 0-5kHz for SSTV/voice
+                        nyq = Config.BLADERF_SAMPLE_RATE / 2
+                        sos_nb = butter(5, min(5000, nyq*0.99) / nyq, btype='low', output='sos')
+                        rf_audio_nb = sosfilt(sos_nb, envelope)
+                        decim = max(1, int(Config.BLADERF_SAMPLE_RATE / 48000))
+                        rf_audio_nb = rf_audio_nb[::decim]
+                        rf_rms = np.sqrt(np.mean(rf_audio_nb**2))
+                        # Wideband 0-10kHz for video sync
+                        sos_wb = butter(5, min(10000, nyq*0.99) / nyq, btype='low', output='sos')
+                        rf_audio_wb = sosfilt(sos_wb, envelope)
+                        rf_audio_wb = rf_audio_wb[::decim]
+                        # Accumulate buffer
+                        if not hasattr(self, '_rf_baseband_buf'):
+                            self._rf_baseband_buf = deque(maxlen=48000*60)
+                            self._rf_wb_buf = deque(maxlen=48000*60)
+                        self._rf_baseband_buf.extend(rf_audio_nb.tolist())
+                        self._rf_wb_buf.extend(rf_audio_wb.tolist())
+                        self._rf_sstv_power = rf_rms
+                        self._rf_sstv_freq = actual_bfreq
+                        self.log.info(f'RF-AM(BR) data: rms={rf_rms:.6f} nb_len={len(rf_audio_nb)} wb_len={len(rf_audio_wb)} env_len={len(envelope)} decim={decim}')
+                        if rf_rms > 0.0001:
+                            # Quick spectral classification
+                            rf_spec = np.abs(np.fft.rfft(rf_audio_wb))
+                            rf_freqs = np.fft.rfftfreq(len(rf_audio_wb), 1.0/48000)
+                            sig8_mask = (rf_freqs >= 7500) & (rf_freqs <= 8500)
+                            pl_mask = (rf_freqs >= 55) & (rf_freqs <= 65)
+                            sstv_mask = (rf_freqs >= 1200) & (rf_freqs <= 2300)
+                            noise_floor = np.median(rf_spec) + 1e-12
+                            sig8_snr = np.max(rf_spec[sig8_mask]) / noise_floor if np.any(sig8_mask) else 0
+                            pl_snr = np.max(rf_spec[pl_mask]) / noise_floor if np.any(pl_mask) else 0
+                            sstv_snr = np.max(rf_spec[sstv_mask]) / noise_floor if np.any(sstv_mask) else 0
+                            self._rf_sig8_snr = sig8_snr
+                            self._rf_pl_snr = pl_snr
+                            self._rf_sstv_snr = sstv_snr
+                            self.sstv.feed(rf_audio_nb)
+                            sstv_rf = self.sstv.scan_buffer()
+                            if sstv_rf:
+                                self.log.warning(f'SSTV RF-AM(BR): {actual_bfreq/1e9:.2f}GHz rms={rf_rms:.4f} -> {sstv_rf["mode"]} ({sstv_rf.get("lines",0)}L)')
+                            if len(rf_audio_nb) >= 100:
+                                import os, time  # wave from global import
+                                ts = time.strftime('%Y%m%d_%H%M%S')
+                                out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rf_baseband')
+                                os.makedirs(out_dir, exist_ok=True)
+                                for label, audio in [('nb', rf_audio_nb), ('wb', rf_audio_wb)]:
+                                    path = os.path.join(out_dir, f'br_rf_{label}_{ts}.wav')
+                                    w = wave.open(path, 'wb'); w.setnchannels(1)
+                                    w.setsampwidth(2); w.setframerate(48000)
+                                    w.writeframes((np.clip(audio,-1,1)*32767).astype(np.int16).tobytes())
+                                    w.close()
+                                self.log.warning(f'RF BASEBAND SAVED: nb={len(rf_audio_nb)} wb={len(rf_audio_wb)} rms={rf_rms:.4f}')
+                            buf_len = len(self._rf_baseband_buf)
+                            # Save buffer every 2 seconds of audio or every 1800 seconds wall-time
+                            save_buf = buf_len >= 48000 * 2
+                            if not save_buf and hasattr(self, '_rf_buf_last_save'):
+                                if time.time() - self._rf_buf_last_save > 1800:
+                                    save_buf = buf_len >= 48000  # at least 1 second
+                            if save_buf and buf_len >= 48000:
+                                ts = time.strftime('%Y%m%d_%H%M%S')
+                                out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rf_baseband')
+                                os.makedirs(out_dir, exist_ok=True)
+                                for label, buf in [('nb', self._rf_baseband_buf), ('wb', self._rf_wb_buf)]:
+                                    arr = np.array(list(buf), dtype=np.float32)
+                                    path = os.path.join(out_dir, f'br_rf_buf_{label}_{ts}.wav')
+                                    w = wave.open(path, 'wb'); w.setnchannels(1)
+                                    w.setsampwidth(2); w.setframerate(48000)
+                                    w.writeframes((np.clip(arr,-1,1)*32767).astype(np.int16).tobytes())
+                                    w.close()
+                                self.log.warning(f'RF BASEBAND(BR) BUFFER SAVED: {buf_len/48000:.1f}s')
+                                self._rf_buf_last_save = time.time()
+                                self._rf_baseband_buf.clear()
+                                self._rf_wb_buf.clear()
+                        else:
+                            self.log.info(f'RF-AM(BR) low: rms={rf_rms:.6f}')
+                    elif self.cycle_count % 2 == 0:
+                        self.log.info(f'RF-AM(BR) debug: bfreq={actual_bfreq} iq1={len(iq1) if iq1 is not None else None} retuning={getattr(self, "_bladerf_retuning", False)}')
+                except Exception as _brf_e:
+                    self.log.info(f'RF-AM(BR) error: {_brf_e}')
                 # Feed ambient mapper with RF band power data
                 try:
                     if self.aoa != 0.0:
@@ -8940,6 +9104,7 @@ class TSCMSystem:
             #
             # 3. HackRF
             hack=self.hackrf.get(); hackrf_active=hack is not None
+            iq_hack=None; h_rf_freq=None
             if hack:
                 iq_hack=hack['data']
                 h_rf_freq = hack.get('frequency', Config.HACKRF_FREQ_TARGET)  # HackRF center frequency
@@ -9000,6 +9165,88 @@ class TSCMSystem:
                 hackrf_power = np.sqrt(np.mean(np.abs(iq_hack)**2))
                 hackrf_bearing = None
                 hackrf_bearing_confidence = 0.0
+
+                # === RF-BASED COMPOSITE SIGNAL DEMODULATION ===
+                # When HackRF sweeps to S-band (2.45 GHz), AM-demod the IQ to
+                # extract the DIRECT microwave carrier envelope.
+                # Carrier contains: voice + SSTV images + video + all composite content.
+                # AM demod = envelope detection via Hilbert transform: |analytic(x)|
+                # This bypasses noisy mic pickup and gives clean baseband.
+                try:
+                    actual_hfreq = getattr(self, '_last_hfreq', None)
+                    iq_len = len(iq_hack) if iq_hack is not None else -1
+                    if self.cycle_count % 10 == 0:
+                        self.log.info(f'RF_AM_DEBUG: _last_hfreq={actual_hfreq} iq_len={iq_len}')
+                    # Always check envelope on S-band HackRF for MW carrier AM demod
+                    from scipy.signal import hilbert, butter, sosfilt
+                    if actual_hfreq is not None and abs(actual_hfreq - 2450e6) < 30e6 and iq_hack is not None and len(iq_hack) >= 8192:
+                        iq_c = iq_hack  # use ALL samples
+                        # AM envelope detection: for complex IQ, envelope = |z|
+                        envelope = np.abs(iq_c)
+                        envelope -= np.mean(envelope)
+                        envelope = np.abs(envelope)
+                        env_max = np.max(np.abs(envelope))
+                        if env_max > 0:
+                            envelope = envelope / env_max
+                        # Narrowband (0-5kHz) for SSTV/voice
+                        nyq = Config.HACKRF_SAMPLE_RATE / 2
+                        sos_nb = butter(5, 5000 / nyq, btype='low', output='sos')
+                        rf_audio_nb = sosfilt(sos_nb, envelope)
+                        decim = max(1, int(Config.HACKRF_SAMPLE_RATE / 48000))
+                        rf_audio_nb = rf_audio_nb[::decim]
+                        rf_rms = np.sqrt(np.mean(rf_audio_nb**2))
+                        # Diagnostic: log envelope stats
+                        env_rms = np.sqrt(np.mean(envelope**2))
+                        env_peak = np.max(np.abs(envelope))
+                        iq_rms = np.sqrt(np.mean(np.abs(iq_c)**2))
+                        self.log.info(f'RF_AM_ENV: iq_rms={iq_rms:.6f} env_rms={env_rms:.6f} env_peak={env_peak:.6f} audio_rms={rf_rms:.6f} n={len(iq_c)}')
+                        # Wideband (0-10kHz) for video sync / full composite
+                        sos_wb = butter(5, 10000 / nyq, btype='low', output='sos')
+                        rf_audio_wb = sosfilt(sos_wb, envelope)
+                        rf_audio_wb = rf_audio_wb[::decim]
+                        # Accumulate into rolling buffer
+                        if not hasattr(self, '_rf_baseband_buf'):
+                            self._rf_baseband_buf = deque(maxlen=48000*300)  # 5 min at 48kHz
+                            self._rf_wb_buf = deque(maxlen=48000*300)
+                        self._rf_baseband_buf.extend(rf_audio_nb.tolist())
+                        self._rf_wb_buf.extend(rf_audio_wb.tolist())
+                        self._rf_sstv_power = rf_rms
+                        self._rf_sstv_freq = actual_hfreq
+                        if rf_rms > 0.00005:  # ultra-low threshold for RF AM baseband
+                            self.sstv.feed(rf_audio_nb)
+                            sstv_rf = self.sstv.scan_buffer()
+                            if sstv_rf:
+                                self.log.warning(f'SSTV RF-AM: {actual_hfreq/1e9:.2f}GHz rms={rf_rms:.4f} -> {sstv_rf["mode"]} ({sstv_rf.get("lines",0)}L)')
+                            # Auto-save when buffer accumulates enough data
+                            buf_len = len(self._rf_baseband_buf)
+                            if buf_len >= 48000 * 10:  # 10 seconds minimum
+                                ts = time.strftime('%Y%m%d_%H%M%S')
+                                out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rf_baseband')
+                                os.makedirs(out_dir, exist_ok=True)
+                                # Save narrowband (voice/SSTV)
+                                nb_arr = np.array(list(self._rf_baseband_buf), dtype=np.float32)
+                                nb_path = os.path.join(out_dir, f'rf_nb_{ts}.wav')
+                                w = wave.open(nb_path, 'wb'); w.setnchannels(1)
+                                w.setsampwidth(2); w.setframerate(48000)
+                                w.writeframes((np.clip(nb_arr, -1, 1)*32767).astype(np.int16).tobytes())
+                                w.close()
+                                # Save wideband (composite with video)
+                                wb_arr = np.array(list(self._rf_wb_buf), dtype=np.float32)
+                                wb_path = os.path.join(out_dir, f'rf_wb_{ts}.wav')
+                                w = wave.open(wb_path, 'wb'); w.setnchannels(1)
+                                w.setsampwidth(2); w.setframerate(48000)
+                                w.writeframes((np.clip(wb_arr, -1, 1)*32767).astype(np.int16).tobytes())
+                                w.close()
+                                self.log.warning(f'RF BASEBAND SAVED: nb={os.path.basename(nb_path)} wb={os.path.basename(wb_path)} ({buf_len/48000:.1f}s)')
+                                # Clear buffer after save
+                                self._rf_baseband_buf.clear()
+                                self._rf_wb_buf.clear()
+                        else:
+                            self._rf_sstv_power = 0
+                except Exception as _rf_e:
+                    if self.cycle_count % 50 == 0:
+                        self.log.info(f'RF AM demod: {_rf_e}')
+                    self._rf_sstv_power = getattr(self, '_rf_sstv_power', 0)
 
                 # SSTV scan on HackRF VLF/HF data (traditional SSTV bands 3-30 MHz)
                 try:
@@ -9288,6 +9535,39 @@ class TSCMSystem:
             if len(ul_chunk)>100:
                 if not self.ul_coherence_queue.full(): self.ul_coherence_queue.put(ul_chunk)
                 self.detectors['eardrum'].update_ultrasound(ul_chunk)
+                # Ultrasonic SSTV scan - video/images may be on ultrasonic carriers
+                # SSTV at high freqs uses different sync tones (e.g. 18-24kHz range)
+                # Scan for structured AM-modulated content in ultrasonic band
+                try:
+                    if self.cycle_count % 5 == 0 and len(ul_chunk) >= 4096:
+                        ul = ul_chunk[:4096].flatten().astype(np.float64)
+                        ul_env = np.abs(np.diff(ul))  # envelope via differentiation
+                        ul_env = np.convolve(ul_env, np.ones(50)/50, mode='same')
+                        # Check for periodic sync-like patterns (regular intervals = possible SSTV)
+                        ul_fft = np.abs(np.fft.rfft(ul_env))
+                        ul_freqs = np.fft.rfftfreq(len(ul_env), 1/384000)
+                        # Look for spectral peaks in 100-500 Hz range (would be line rate of ultrasonic SSTV)
+                        lr_band = (ul_freqs > 100) & (ul_freqs < 500)
+                        if np.any(lr_band):
+                            lr_peaks = ul_fft[lr_band]
+                            lr_max = np.max(lr_peaks)
+                            lr_noise = np.median(lr_peaks) + 1e-12
+                            if lr_max > lr_noise * 5:
+                                peak_freq = ul_freqs[np.where(lr_band)[0][np.argmax(lr_peaks)]]
+                                # Convert to line rate: if sync tone at 18kHz, lines at ~10-20 Hz
+                                lines_per_sec = peak_freq
+                                self.log.warning(f'ULTRASONIC SSTV: line_rate={lines_per_sec:.1f}Hz snr={lr_max/lr_noise:.1f} ul_rms={np.sqrt(np.mean(ul**2)):.4f}')
+                                self.localization.add_observation(
+                                    fingerprint=b'ultrasonic_sstv',
+                                    obs_lat=lat, obs_lon=lon,
+                                    bearing_deg=self.aoa if self.aoa else None,
+                                    range_m=None, freq=384000,
+                                    classification='detection',
+                                    detector_name='ultrasonic_sstv',
+                                    snr=float(lr_max/lr_noise))
+                except Exception as _ul_e:
+                    if self.cycle_count % 50 == 0:
+                        self.log.info(f'UL SSTV: {_ul_e}')
             if len(lpt_chunk)>100:
                 self.detectors['ai_voice'].update(lpt_chunk)
                 self.detectors['sstv'].update(lpt_chunk)
@@ -9511,7 +9791,7 @@ class TSCMSystem:
                         self.log.info(f'WHISPER: "{text}" bearing={self.aoa:.1f}deg')
                         # Save audio clip for forensic evidence
                         try:
-                            import wave, struct
+                                # Save audio clip for forensic evidence
                             clip_dir = os.path.join(os.path.dirname(__file__), 'voice_clips')
                             os.makedirs(clip_dir, exist_ok=True)
                             ts = time.strftime('%Y%m%d_%H%M%S')
@@ -10166,6 +10446,14 @@ class TSCMSystem:
                         self.log.warning(f'RF BURST: {b["delta_db"]:+.0f}dB at {b["freq_center"]/1e6:.1f}MHz')
             except: pass
 
+            # 9b. Power line envelope check (every 30 cycles)
+            if self.cycle_count % 30 == 0 and hasattr(self, 'mic_audio') and self.mic_audio is not None:
+                try:
+                    env_result = self.pl_envelope.check(self.mic_audio)
+                    if env_result and env_result['mod_strength'] > 0.3:
+                        self.log.info(f'60Hz ENV MOD: strength={env_result["mod_strength"]:.2f} top={max(env_result["harmonics"].values()):.0f}dB')
+                except: pass
+
             # 9a. Threat scoring - score all sources
 
             # Spectral waterfall snapshot (every 5 cycles)
@@ -10794,7 +11082,7 @@ class TSCMSystem:
                                 fft_freqs = np.fft.rfftfreq(2048, 1/Config.BLADERF_SAMPLE_RATE)
                                 noise_floor = np.median(base_fft) + 1e-12
 
-                                from scipy.signal import find_peaks
+                                # find_peaks from global import
                                 echo_peaks, echo_props = find_peaks(
                                     diff_fft, height=noise_floor*3, distance=5, prominence=noise_floor*2)
 
@@ -11037,10 +11325,23 @@ class TSCMSystem:
                 'bearing_heatmap':self.bearing_heatmap.get_heatmap_data(),
                 'hot_bearings':self.bearing_heatmap.get_hot_bearings(10),
                 'sstv_status':self.sstv.get_status(),
+                'rf_sstv_demod':{
+                    'power': getattr(self, '_rf_sstv_power', 0),
+                    'freq_ghz': getattr(self, '_rf_sstv_freq', 0)/1e9 if hasattr(self, '_rf_sstv_freq') else 0,
+                    'active': getattr(self, '_rf_sstv_power', 0) > 0.001,
+                    'last_hfreq_mhz': getattr(self, '_last_hfreq', 0)/1e6 if hasattr(self, '_last_hfreq') else 0,
+                    'hackrf_active': hackrf_active,
+                    'iq_len': len(iq_hack) if iq_hack is not None else 0,
+                    'cycle': self.cycle_count,
+                    'sig8_snr': getattr(self, '_rf_sig8_snr', 0),
+                    'pl_snr': getattr(self, '_rf_pl_snr', 0),
+                    'sstv_snr': getattr(self, '_rf_sstv_snr', 0)
+                },
                 'vv_channels':self.vv_correlator.get_report(),
                 'rf_bursts':self.rf_burst.get_status(),
                 'waterfall':self.waterfall.get_status(),
                 'wifi_clients':self.wifi_tracker.get_status(),
+                'power_line_envelope':self.pl_envelope.get_status(),
                 'watcher_findings': [{'type': f.get('type','?'), 'info': f.get('info','')[:100]}
                                 for f in list(self.watcher.findings)[-5:]],
                 'wifi_aps':wigle_aps,
@@ -11066,7 +11367,8 @@ class TSCMSystem:
             # Retune HackRF if band changed
             if getattr(self, '_last_hfreq', 0) != h_freq:
                 self._last_hfreq = h_freq
-                self.hackrf.retune(h_freq, h_rate)
+                ret = self.hackrf.retune(h_freq, h_rate)
+                self.log.info(f'SWEEP RETUNE: {h_name} -> {h_freq/1e6:.1f}MHz rate={h_rate/1e6:.1f}MHz ok={ret}')
                 # Clear detector buffers on retune - stale data at old frequency
                 for dname in ['forced_thought','variac','pll_resonance',
                               'bucket_resonator','ecpri_injection','fingerprinting',
@@ -11097,9 +11399,19 @@ class TSCMSystem:
                 except Exception as e:
                     self.log.debug(f'PL detect error: {e}')
 
-            # BladeRF sweep disabled - RX bridge owns device, CLI -e mode conflicts
-            # BladeRF stays at 2.4 GHz S-band with MIMO AoA (best band for MW detection)
-            # To sweep: need in-band retune via capture loop, not separate CLI process
+            # BladeRF in-band retune: change frequency in capture loop for MW carrier capture
+            if self.bladerf_cli is not None:
+                if getattr(self, '_last_bfreq', 0) != b_freq:
+                    self._last_bfreq = b_freq
+                    self.bladerf_cli.freq = int(b_freq)
+                    self.bladerf_cli.sample_rate = int(b_rate)
+                    self.log.info(f'BLADERF RETUNE: {b_name} -> {b_freq/1e6:.1f}MHz rate={b_rate/1e6:.1f}MHz')
+                    # Skip next AoA computation during retune transition
+                    self._bladerf_retuning = True
+                else:
+                    self._bladerf_retuning = getattr(self, '_bladerf_retuning', False)
+            else:
+                self._bladerf_retuning = False
 
             print(f"  Cycle {self.cycle_count} | AoA:{self.aoa:.1f}deg  | "
                   f"Sources:{n_src} resolved, {n_bear} bearing-only | "
