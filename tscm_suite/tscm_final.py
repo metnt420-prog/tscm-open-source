@@ -1486,7 +1486,7 @@ class Victim2kDetector:
         # Save V2K audio clip
         if results and len(self.buf_48k) > 16000:
             try:
-                import os, time  # wave, os, time from global imports
+                # wave, os, time from global imports
                 clip_dir = os.path.join(os.path.dirname(__file__), 'voice_clips')
                 os.makedirs(clip_dir, exist_ok=True)
                 ts = time.strftime('%Y%m%d_%H%M%S')
@@ -9056,7 +9056,7 @@ class TSCMSystem:
                             if sstv_rf:
                                 self.log.warning(f'SSTV RF-AM(BR): {actual_bfreq/1e9:.2f}GHz rms={rf_rms:.4f} -> {sstv_rf["mode"]} ({sstv_rf.get("lines",0)}L)')
                             if len(rf_audio_nb) >= 100:
-                                import os, time  # wave from global import
+                                # wave, os, time from global imports
                                 ts = time.strftime('%Y%m%d_%H%M%S')
                                 out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rf_baseband')
                                 os.makedirs(out_dir, exist_ok=True)
