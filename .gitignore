@@ -1,67 +1,51 @@
-# Git ignore for TSCM Suite
-
-# Python
+# TSCM generated/volatile data
+tile_cache/
+voice_clips/
+video_output/
 __pycache__/
-*.py[cod]
-*.so
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environments
-venv/
-.env/
-env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-Desktop.ini
-
-# TSCM runtime data (contains private detection data)
-models/
+*.pyc
+*.log
+detections.log
+evidence_*/
+evidence/
+evidence_archive/
 evidence_hourly/
-decoded_voice/
+evidence_snapshots/
+sstv_captures/
+sstv_audio/
+sstv_avg/
+sstv_clean/
+sstv_composites/
+sstv_composite_v2/
+sstv_decoded/
+sstv_enhanced/
+sstv_rf_demod/
+sstv_analysis/
 demod_audio/
-*.log
-detections*.log
-*.log
-*.jsonl
-*.txt (except requirements*.txt)
-
-# Backup files
-*_backup_*.py
-*_restored.py
-
-# Debug/temp files
-_debug_*.txt
-_*.txt
-*.bin
-*.sc16q11
-
-# SDR/radio captures
-*.iq
-
-# Binary tools (not ours to distribute)
-*.exe
-*.dll
-
-# Config with sensitive data
-config.yaml
-gps_home.json
-
-# Keep these specific files
-!requirements*.txt
-!config.yaml.example
-
-# Keep docs
-!docs/*.md
-!*.md
-_pages_git/
+decoded_voice/
+decoder_media/
+tts_output/
+jammer_captures/
+rf_baseband/
+rf_analysis/
+waterfall_snapshots/
+eeg_screenshots/
+court_package/
+court_screenshots/
+freq_encoded_images/
+subcarrier_analysis/
+ultrasonic_analysis/
+transcribed_voice/
+video_captures/
+video_output/
+antidote_audio/
+audit/
+bearing_history/
+freq_encoded_images/
+map_assets/
+node_modules/
+.cluster/
+*.bak_wiggle
+_*.py
+watchdog_guardian.py.log
+tscm.pid
