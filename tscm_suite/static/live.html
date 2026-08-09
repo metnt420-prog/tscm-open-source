@@ -1,0 +1,318 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TSCM â€” LIVE TRACKING</title>
+<link rel="stylesheet" href="/static/leaflet.css">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden;font:12px 'Segoe UI',system-ui,sans-serif}
+#map{width:100vw;height:100vh;background:#0a0a0a}
+#status{position:fixed;top:8px;right:8px;z-index:1000;
+  background:rgba(0,0,0,0.75);color:#ddd;padding:8px 12px;
+  border-radius:6px;border:1px solid rgba(255,255,255,0.15);
+  font-size:11px;backdrop-filter:blur(4px);min-width:140px}
+#status .val{color:#e8943a;font-weight:700}
+#status .warn{color:#e8483a}
+#status .ok{color:#3ac8a0}
+#uspanel{position:fixed;bottom:8px;left:8px;z-index:1000;background:rgba(0,0,0,0.82);
+  border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:6px 8px;width:390px;
+  backdrop-filter:blur(4px);font-size:9px}
+#uspanel .us-head{color:#e8943a;font-size:9px;letter-spacing:1px;margin-bottom:3px;display:flex;justify-content:space-between}
+#uspanel canvas{width:100%;background:#020a08;border:1px solid rgba(255,255,255,0.08);border-radius:3px}
+#uspanel .us-label{color:#667;font-size:8px;margin:2px 0 4px;letter-spacing:1px}
+#uspanel .us-note{color:#557;font-size:8px;margin-top:2px}
+#side{position:fixed;top:8px;left:8px;bottom:8px;z-index:1000;
+  background:rgba(0,0,0,0.75);color:#ddd;padding:8px 10px;
+  border-radius:6px;border:1px solid rgba(255,255,255,0.15);
+  width:240px;overflow-y:auto;font-size:9px;backdrop-filter:blur(3px);max-height:70vh;
+  display:flex;flex-direction:column}
+#side h3{color:#e8943a;font-size:10px;letter-spacing:1px;margin:0 0 4px}
+.det-row{padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.06);
+  display:flex;justify-content:space-between;color:#aaa}
+.det-row .bear{color:#e8943a;font-size:9px}
+.leaflet-tooltip.det-tooltip{
+  background:rgba(0,0,0,0.9);color:#e8e8e8;border:1px solid #e8943a;
+  border-radius:6px;padding:8px 12px;font:11px 'Consolas',monospace;
+  box-shadow:0 2px 12px rgba(232,148,58,0.3);pointer-events:auto}
+.leaflet-tooltip.det-tooltip::before{border-top-color:#e8943a}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="side"><div style="color:#e8943a;font-size:9px;margin-bottom:4px">BOOKMARK: http://localhost:8081/live</div>
+  <h3>â—† DETECTIONS <span id="side-count" style="color:#888">--</span></h3>
+  <div id="side-list" style="flex:1;overflow-y:auto"></div>
+</div>
+<div id="status">
+  <div>Sources: <span class="val" id="st-srcs">--</span></div>
+  <div>AoA: <span class="val" id="st-aoa">--</span>Â°</div>
+  <div>GPS: <span class="val" id="st-gps">--</span></div>
+  <div>Mapped: <span class="val" id="st-mapped">--</span></div>
+  <div style="margin-top:4px">BladeRF: <span class="val ok" id="st-brf">--</span></div>
+  <div>HackRF: <span class="val ok" id="st-hrf">--</span></div>
+  <div>RTL-SDR: <span class="val ok" id="st-rtl">--</span></div>
+  <div>Petterson: <span class="val ok" id="st-pet">--</span></div>
+    <div id="cam-box" style="margin:8px 0 0"><img id="cam-preview" src="/camera/snap" style="width:130px;height:auto;border:1px solid rgba(150,150,150,0.3);border-radius:3px;opacity:0.85" onerror="this.parentElement.style.display='none'" /></div>
+</div>
+
+<div id="uspanel">
+  <div class="us-head"><span>ULTRASONIC SPECTRUM</span><span id="us-ts">--</span></div>
+  <canvas id="us-pet" width="760" height="110"></canvas>
+  <div class="us-label">PETT MSSON M500 - 0-192 kHz (full band)</div>
+  <canvas id="us-lap" width="760" height="80"></canvas>
+  <div class="us-label">LAPTOP SPATIAL ARRAY - 0-24 kHz</div>
+  <div class="us-note">pink dashes = detected modem / victim carriers</div>
+</div>
+<script src="/static/leaflet.js"></script>
+<script>
+var home = [41.51325, -88.13368];
+var map = L.map('map', {center:home, zoom:16, minZoom:0, maxZoom:21, zoomControl:true, attributionControl:false});
+
+// Base layers — OSM default (shows streets/houses), satellite as toggles
+var osmLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom:19, attribution:'&copy; OpenStreetMap'
+});
+var satLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom:20, attribution:'Esri'
+});
+var googleSatLayer = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+  maxZoom:21, maxNativeZoom:20
+});
+
+// Start with OpenStreetMap (houses + street names visible)
+satLayer.addTo(map);  // Default: satellite with house outlines
+var baseLayers = {'Streets (OSM)': osmLayer, 'Satellite (Esri)': satLayer, 'Satellite (Google)': googleSatLayer};
+L.control.layers(baseLayers, null, {position:'bottomright'}).addTo(map);
+
+var markerLayer = L.layerGroup().addTo(map);
+var rangeRings = L.layerGroup(); // hidden by default
+var aoaLine = null;
+var hullLine = null;
+
+L.circleMarker(home, {radius:8, fillColor:'#3ac8a0', color:'#fff', weight:3, fillOpacity:0.9})
+  .addTo(map).bindTooltip('YOU (HOME)', {permanent:true, direction:'right', className:'det-tooltip', offset:[10,0]});
+
+[100,300,1000,3000,8000].forEach(function(r){
+  L.circle(home, {radius:r, color:'rgba(180,190,200,0.4)', weight:1, fill:false}).addTo(rangeRings);
+});
+
+function escH(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function getColor(det, cls) {
+  var dl = (det||'').toLowerCase(), cl = (cls||'').toLowerCase();
+  if(dl.indexOf('c2')>=0||cl.indexOf('attack')>=0) return '#e8483a';
+  if(dl.indexOf('mw_voice')>=0||dl.indexOf('carbon')>=0) return '#e848b0';
+  if(dl.indexOf('silent')>=0) return '#e8943a';
+  if(dl.indexOf('eeg')>=0) return '#e8e03a';
+  if(dl.indexOf('ultrasound')>=0) return '#c03ae8';
+  if(dl.indexOf('stingray')>=0) return '#ff0000';
+  return '#e8943a';
+}
+
+function convexHull(points) {
+  if(points.length<3) return points;
+  points = points.sort(function(a,b){return a[0]-b[0]||a[1]-b[1]});
+  var cross=function(o,a,b){return (a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0])};
+  var lo=[],up=[],i;
+  for(i=0;i<points.length;i++){while(lo.length>=2&&cross(lo[lo.length-2],lo[lo.length-1],points[i])<=0)lo.pop();lo.push(points[i]);}
+  for(i=points.length-1;i>=0;i--){while(up.length>=2&&cross(up[up.length-2],up[up.length-1],points[i])<=0)up.pop();up.push(points[i]);}
+  return lo.slice(0,-1).concat(up.slice(0,-1));
+}
+function fetchAddr(lat,lon,el){
+  el.textContent='looking up...';
+  fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat='+lat+'&lon='+lon+'&zoom=18&addressdetails=1')
+    .then(function(r){return r.json()})
+    .then(function(d){el.textContent=d.display_name||(lat.toFixed(5)+','+lon.toFixed(5));el.style.color='#e8943a'})
+    .catch(function(){el.textContent=lat.toFixed(5)+','+lon.toFixed(5)});
+}
+
+function update() {
+  fetch('/camera/snap').then(function(r){if(r.ok){var img=document.getElementById('cam-preview');img.src='/camera/snap?'+Date.now()}}).catch(function(){});
+  fetch('/api/detections').then(function(r){return r.json()}).then(function(d){
+    var sources = d.sources || [];
+    var obs = d.observer || {};
+    
+    document.getElementById('st-srcs').textContent = sources.length;
+    document.getElementById('st-aoa').textContent = (obs.aoa||0).toFixed(1);
+    var gps = document.getElementById('st-gps');
+    gps.textContent = obs.gps_fix ? 'FIX' : 'NO FIX';
+    gps.className = obs.gps_fix ? 'val ok' : 'val warn';
+
+    // Sort by threat priority
+    var threat = {c2:0,attack:1,mw_voice:2,carbon:3,silent:4,eeg:5,ultrasound:6,stingray:0};
+    sources.sort(function(a,b){
+      var da=(a.detector||'').toLowerCase(),db=(b.detector||'').toLowerCase();
+      var pa=99,pb=99;
+      for(var k in threat){if(da.indexOf(k)>=0)pa=Math.min(pa,threat[k]);if(db.indexOf(k)>=0)pb=Math.min(pb,threat[k]);}
+      if(pa!==pb) return pa-pb;
+      return (b.observations||0)-(a.observations||0);
+    });
+
+    // Sidebar list â€” show ALL sources (with and without coordinates)
+    var sideHTML = '';
+    var mappedCount = 0;
+    sources.forEach(function(s,i){
+      var hasCoord = s.lat && s.lon && Math.abs(s.lat)>0.001;
+      if(hasCoord) mappedCount++;
+      var color = getColor(s.detector||'', s.classification||'');
+      var name = (s.detector||'unknown').substring(0,18);
+      var freq = s.freq||0;
+      var fs = freq>1e6?(freq/1e6).toFixed(1)+'M':(freq>1e3?(freq/1e3).toFixed(1)+'k':freq.toFixed(0));
+      var bear = s.bearing ? Math.round(s.bearing)+'\u00B0' : '';
+      var icon = hasCoord ? '\u25CF' : '\u25D8';
+      sideHTML += '<div class="det-row">'+
+        '<span><span style="color:'+color+'">'+icon+'</span> '+escH(name)+'</span>'+
+        '<span class="bear">'+bear+(bear?' ':'')+fs+'</span></div>';
+    });
+    document.getElementById('side-list').innerHTML = sideHTML || '<div style="color:#666;padding:10px">NO DETECTIONS</div>';
+    document.getElementById('side-count').textContent = sources.length + ' total';
+    document.getElementById('st-mapped').textContent = mappedCount + ' mapped';
+    // Equipment status
+    var obs = d.observer || {};
+    document.getElementById('st-brf').textContent = obs.bladerf ? 'ON' : 'OFF';
+    document.getElementById('st-brf').className = obs.bladerf ? 'val ok' : 'val warn';
+    document.getElementById('st-hrf').textContent = obs.hackrf ? 'ON' : 'OFF';
+    document.getElementById('st-hrf').className = obs.hackrf ? 'val ok' : 'val warn';
+    var rtl = obs.rtlsdr || false;
+    document.getElementById('st-rtl').textContent = rtl ? 'ON' : 'OFF';
+    document.getElementById('st-rtl').className = rtl ? 'val ok' : 'val warn';
+    var petRate = obs.pet_rate || 0;
+    document.getElementById('st-pet').textContent = (petRate/1000).toFixed(0) + 'kHz';
+    document.getElementById('st-pet').className = petRate >= 100000 ? 'val ok' : 'val warn';
+
+    // === ULTRASONIC SPECTRUM PANEL ===
+    var us = d.us_spectrum || {};
+    if(us.ts) document.getElementById('us-ts').textContent = new Date(us.ts*1000).toLocaleTimeString();
+    var usMarkers = [];
+    sources.forEach(function(s){
+      var f = s.freq||0;
+      if(f>15000 && f<200000 && (s.classification||'').length) usMarkers.push({f:f});
+    });
+    drawSpec(document.getElementById('us-pet'), us.petterson, 'pet', usMarkers, 192000);
+    drawSpec(document.getElementById('us-lap'), us.laptop, 'lap', null, 24000);
+
+    // Map markers â€” ALL sources get bearing lines + coordinate markers if available
+    markerLayer.clearLayers();
+    if(hullLine) { map.removeLayer(hullLine); hullLine = null; }
+    if(aoaLine) { map.removeLayer(aoaLine); aoaLine = null; }
+
+    var positions = [[home[0], home[1]]];
+    var bearingLines = [];
+    sources.forEach(function(s){
+      var color = getColor(s.detector||'', s.classification||'');
+      var freq = s.freq||0;
+      var fs = freq>1e9?(freq/1e9).toFixed(2)+'G':(freq>1e6?(freq/1e6).toFixed(1)+'M':(freq>1e3?(freq/1e3).toFixed(1)+'k':freq.toFixed(0)+'Hz'));
+      var bear = s.bearing;
+      var hasBear = bear != null && Math.abs(bear) > 0.5;
+      var hasCoord = s.lat && s.lon && Math.abs(s.lat) > 0.001;
+      
+      // Bearing lines from home for ALL sources with bearing (even without coords)
+      if (hasBear) {
+        var rad = bear * Math.PI / 180;
+        var lineLen = s.range ? s.range : 5000;  // use range if available, else 5km default
+        var endLat = home[0] + Math.cos(rad) * lineLen / 111320;
+        var endLon = home[1] + Math.sin(rad) * lineLen / (111320 * Math.cos(home[0] * Math.PI/180));
+        var line = L.polyline([home, [endLat, endLon]], {
+          color: color, weight: 2.5, opacity: 0.85, dashArray: '8,3'
+        });
+        bearingLines.push(line);
+        
+        // Endpoint marker on bearing line
+        var epR = 7;
+        L.circleMarker([endLat, endLon], {
+          radius: epR, color: color, fillColor: color, fillOpacity: 0.8, weight: 1
+        }).addTo(markerLayer);
+      }
+      
+      // Coordinate markers for sources with positions
+      if (hasCoord) {
+        positions.push([s.lat, s.lon]);
+        var m = L.circleMarker([s.lat, s.lon], {
+          radius: s.triangulated?10:7, color: '#fff', weight: 3, fillColor: color, fillOpacity: 0.9
+        }).addTo(markerLayer);
+        
+        var html = '<b style="color:'+color+'">'+escH(s.detector||'unknown')+'</b><br>'+
+          'Freq: '+fs+' | '+escH(s.classification||'--')+'<br>'+
+          'Bearing: '+(hasBear?Math.round(bear)+'\u00B0':'--')+'<br>'+
+          (s.triangulated?'<b style="color:#3ac8a0">TRIANGULATED</b> ':'')+
+          'Obs: '+(s.observations||1);
+        m.bindTooltip(html, {direction:'top', className:'det-tooltip', offset:[0,-8]});
+      }
+    });
+    
+    // Add all bearing lines at once
+    bearingLines.forEach(function(bl){ bl.addTo(markerLayer); });
+
+    // Convex hull
+    var hull = convexHull(positions);
+    if(hull.length >= 3) {
+      hull.push(hull[0]);
+      hullLine = L.polyline(hull, {
+        color:'#e8943a', weight:2, opacity:0.7, dashArray:'8,4'
+      }).addTo(map);
+      hull.slice(0,-1).forEach(function(p){
+        L.circleMarker(p, {radius:4, color:'#c85000', fillColor:'#c85000', fillOpacity:0.8, weight:2})
+          .addTo(markerLayer).bindTooltip('ENDPOINT', {className:'det-tooltip'});
+      });
+      // Auto-zoom disabled: user controls map view. Hull is drawn regardless.
+    }
+
+    // AoA
+    var aoa = obs.aoa || 0;
+    if(Math.abs(aoa) > 0.5) {
+      var rad = aoa * Math.PI/180;
+      var endLat = home[0] + Math.cos(rad)*0.1;
+      var endLon = home[1] + Math.sin(rad)*0.1/Math.cos(home[0]*Math.PI/180);
+      aoaLine = L.polyline([home, [endLat, endLon]], {
+        color:'#ff2828', weight:3, opacity:0.8
+      }).addTo(map).bindTooltip('AoA '+aoa.toFixed(0)+'\u00B0', {permanent:true, className:'det-tooltip'});
+    }
+  }).catch(function(){});
+}
+
+var usHist = {pet: [], lap: []};
+function drawSpec(canvas, spec, histKey, markers, maxF){
+  if(!spec || !spec.power) return;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  var p = spec.power, n = p.length;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = '#020a08'; ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle = 'rgba(58,200,160,0.22)'; ctx.lineWidth = 1;
+  for(var g=0; g<=4; g++){ var gy = H - (H*g/4); ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke(); }
+  var maxV = 8;
+  p.forEach(function(v){ if(v>maxV) maxV=v; });
+  maxV = Math.max(maxV, 3);
+  var hist = usHist[histKey] || []; hist.push(p.slice()); if(hist.length>40) hist.shift(); usHist[histKey]=hist;
+  hist.forEach(function(pp, hi){
+    var alpha = 0.05 + 0.6 * (hi/hist.length);
+    ctx.strokeStyle = 'rgba(232,148,58,'+alpha.toFixed(3)+')';
+    ctx.beginPath();
+    for(var i=0;i<pp.length;i++){ var x=(i/(n-1))*W; var y=H-Math.min(pp[i],maxV)/maxV*H; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
+  });
+  if(markers){
+    markers.forEach(function(mk){
+      var x = (mk.f/maxF)*W;
+      if(x<0||x>W) return;
+      ctx.strokeStyle = 'rgba(232,72,176,0.9)'; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#e848b0'; ctx.font = '8px Consolas';
+      ctx.fillText((mk.f/1000).toFixed(0)+'k', x+2, 8);
+    });
+  }
+}
+
+update();
+setInterval(update, 4000);
+
+document.addEventListener('keydown',function(e){
+  if(e.key==='r') update();
+  if(e.key==='f') { try{var b=map.getBounds();map.fitBounds(b);}catch(e){} }
+  if(e.key==='h') map.setView(home, 15);
+});
+</script>
+</body>
+</html>

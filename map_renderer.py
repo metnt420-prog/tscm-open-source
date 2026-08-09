@@ -199,7 +199,7 @@ def _clamp_bearing_to_map(cx, cy, bearing_deg, map_w, map_top, map_bot, scale):
     edge_dist = int(max(1, t_max))
     return int(cx + dx * edge_dist), int(cy + dy * edge_dist)
 
-def render_map(detections_data, width=3200, height=1800, zoom=18):
+def render_map(detections_data, width=3200, height=1800, zoom=15):
     """Render full sat map with overlay. Returns PNG bytes.
     Auto-zoom: zooms out to fit all markers if they extend beyond the viewport."""
     sources = detections_data.get('sources', [])
@@ -231,10 +231,10 @@ def render_map(detections_data, width=3200, height=1800, zoom=18):
             required_mpp = max(required_mpp_lat, required_mpp_lon, 0.001)
             # Compute zoom: mpp = 156543 * cos(lat) / 2^z
             auto_zoom = int(math.log2(156543.0339 * math.cos(math.radians(observed_lat)) / required_mpp))
-            auto_zoom = max(12, min(20, int(zoom) if auto_zoom <= 12 else auto_zoom))
+            auto_zoom = max(0, min(17, int(zoom) if auto_zoom <= 0 else auto_zoom))  # cap at 17 — above that sat tiles are brown mush
             zoom = auto_zoom
 
-    zoom = max(12, min(20, int(zoom)))
+    zoom = max(0, min(17, int(zoom)))  # cap at 17
 
     # Fast-path: above 500 sources, switch to batched dot rendering
     FAST_PATH_THRESHOLD = 500
@@ -336,7 +336,7 @@ def render_map(detections_data, width=3200, height=1800, zoom=18):
         font_title = font
 
     # Scale: pixels per meter at this zoom level
-    # At zoom 16, 1 pixel ≈ 2.39m at equator. At lat 41.5°, ≈ 2.39 * cos(41.5°) ≈ 1.79m
+    # At zoom 16, 1 pixel â‰ˆ 2.39m at equator. At lat 41.5Â°, â‰ˆ 2.39 * cos(41.5Â°) â‰ˆ 1.79m
     meters_per_pixel = 156543.0339 * math.cos(math.radians(observed_lat)) / (2 ** zoom)
     scale = 1.0 / meters_per_pixel  # pixels per meter
 
@@ -397,7 +397,7 @@ def render_map(detections_data, width=3200, height=1800, zoom=18):
             freq = s.get('freq', 0)
             if freq > 0:
                 no_bearing[det]['freqs'].append(freq)
-        # Skip per-point rendering entirely — sidebar counts are sufficient for overview.
+        # Skip per-point rendering entirely â€” sidebar counts are sufficient for overview.
         # Individual detail markers only appear in <500 source standard path.
         # (This keeps the fast path targeting ~1-2s for tile compositing only.)
     else:
