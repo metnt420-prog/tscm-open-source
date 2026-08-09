@@ -4891,7 +4891,9 @@ class MapHandler(BaseHTTPRequestHandler):
             except: pass
 
     def _do_GET(self):
-        if self.path == '/camera' or self.path == '/camera/snap':
+        from urllib.parse import urlsplit
+        _p = urlsplit(self.path).path
+        if _p == '/camera' or _p == '/camera/snap':
             if not self._is_local():
                 self.send_error(403); return
             import time as _t
@@ -5176,8 +5178,8 @@ class MapHandler(BaseHTTPRequestHandler):
 
         elif self.path.startswith('/static/'):
             filename = self.path[len('/static/'):]
-            # Only allow alphanumeric, dot, dash, underscore
-            if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
+            # Allow alphanumeric, dot, dash, underscore, slash; block traversal
+            if '..' in filename or not re.match(r'^[a-zA-Z0-9._/-]+$', filename):
                 self.send_error(403)
                 return
             fpath = os.path.join(os.path.dirname(__file__), 'static', filename)
