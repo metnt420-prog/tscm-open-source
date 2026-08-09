@@ -4894,22 +4894,51 @@ class MapHandler(BaseHTTPRequestHandler):
         if self.path == '/camera' or self.path == '/camera/snap':
             if not self._is_local():
                 self.send_error(403); return
+            import time as _t
+            _now = _t.time()
+            _cstate = getattr(self, '_camera_state', {'last_probe': 0})
+            # The suite process NEVER opens the camera directly: the broken
+            # NVIDIA Broadcast virtual cam corrupts the process heap
+            # (STATUS_HEAP_CORRUPTION crash-loop 2026-08-09). Capture runs in a
+            # subprocess (camera_probe.py); any driver crash kills only the child.
+            _live = None
             try:
-                import cv2
-                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-                ok, frame = cap.read()
-                cap.release()
-                if ok and frame is not None:
-                    _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                _lp = r'C:\Users\carpe\.openclaw-autoclaw\workspace\camera_live.jpg'
+                if os.path.exists(_lp) and (_now - os.path.getmtime(_lp)) < 45:
+                    with open(_lp, 'rb') as _f:
+                        _live = _f.read()
+            except Exception:
+                _live = None
+            # kick a probe if none ran in the last 60s (child process, safe)
+            if _now - _cstate['last_probe'] >= 60:
+                _cstate['last_probe'] = _now
+                self._camera_state = _cstate
+                try:
+                    import subprocess as _sp
+                    _sp.Popen([sys.executable, r'C:\Users\carpe\.openclaw-autoclaw\workspace\camera_probe.py'],
+                              cwd=r'C:\Users\carpe\.openclaw-autoclaw\workspace',
+                              stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                except Exception:
+                    pass
+            if _live is not None:
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Cache-Control', 'no-cache')
+                self.send_header('X-Camera-Status', 'live')
+                self.end_headers()
+                self.wfile.write(_live)
+            else:
+                try:
+                    with open(r'C:\Users\carpe\.openclaw-autoclaw\workspace\camera_last_good.jpg', 'rb') as _f:
+                        _fb = _f.read()
                     self.send_response(200)
                     self.send_header('Content-Type', 'image/jpeg')
                     self.send_header('Cache-Control', 'no-cache')
+                    self.send_header('X-Camera-Status', 'last-good')
                     self.end_headers()
-                    self.wfile.write(buf.tobytes())
-                else:
-                    self.send_error(500, 'Camera read failed')
-            except Exception as e:
-                self.send_error(500, str(e))
+                    self.wfile.write(_fb)
+                except Exception:
+                    self.send_error(503, 'Camera unavailable')
             return
 
         if not self._is_local():
@@ -5725,6 +5754,15 @@ class RTLSDRCapture:
             self.thread.start()
             return True
 
+        # No driver bound / ctypes path failed: skip the libusb fallback entirely.
+        # libusb on a driverless or DVB-locked device can crash the process
+        # (heap corruption, STATUS_HEAP_CORRUPTION - observed 2026-08-09). The
+        # fallback never worked anyway; the fix is a WinUSB driver (Zadig).
+        if not hasattr(self, '_nodriver_warned'):
+            self._nodriver_warned = True
+            sys.stderr.write("RTL-SDR: ctypes path failed - skipping libusb fallback. Install WinUSB driver via Zadig (VID 0BDA PID 2838 -> WinUSB).\n")
+            sys.stderr.flush()
+        return False
         # Fallback: try rtlsdr Python package (needs libusb/WinUSB driver)
         # Suppress repeated error messages on retry attempts
         if not hasattr(self, '_fallback_tried'):
@@ -12109,8 +12147,11 @@ class TSCMSystem:
                     self.log.info(f"Ã°Å¸â€œÂ¡ AoA: {self.aoa}deg  ({self.aoa_source})"
                                   +(f" | Range: {self.passive_radar_range:.0f}m" if self.passive_radar_range else ""))
 
-                # Court: save raw BladeRF IQ every 30 cycles (~2 min)
-                if self.cycle_count % 30 == 0 and iq1 is not None:
+                # Court: save raw BladeRF IQ every 30 cycles (~2 min),
+                # or at least every 15 min even when cycles run long.
+                _last_snap_ts = getattr(self, '_last_snap_ts', 0)
+                if (self.cycle_count % 30 == 0 or (time.time() - _last_snap_ts) > 900) and iq1 is not None:
+                    self._last_snap_ts = time.time()
                     self.court.save_raw_iq(iq1, "bladerf_ch1", Config.BLADERF_FREQ,
                                            Config.BLADERF_SAMPLE_RATE, self.aoa)
                     self.court.save_raw_iq(iq2, "bladerf_ch2", Config.BLADERF_FREQ,
@@ -14881,7 +14922,7 @@ class TSCMSystem:
             map_data={
                 'observer':{'lat':lat,'lon':lon,'aoa':self.aoa,'aoa_alt':getattr(self,'aoa_alternate',self.aoa+180 if self.aoa!=0 else 0),'gps_fix':gps['has_fix'],
                             'bladerf':bladerf_active,'hackrf':hackrf_active,
-                            'pet_rate':self.petterson.fs, 'rtlsdr':self.rtlsdr is not None,
+                            'pet_rate':self.petterson.fs, 'rtlsdr':self.rtlsdr is not None and getattr(self.rtlsdr, 'active', False),
                             'hackrf_lat':self.localization.hackrf_lat,
                             'hackrf_lon':self.localization.hackrf_lon,
                             'rtlsdr_lat':getattr(self.localization,'rtlsdr_lat',None),
