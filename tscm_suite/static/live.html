@@ -14,6 +14,9 @@ body{background:#000;overflow:hidden;font:12px 'Segoe UI',system-ui,sans-serif}
   border-radius:6px;border:1px solid rgba(255,255,255,0.15);
   font-size:11px;backdrop-filter:blur(4px);min-width:140px}
 #status .val{color:#e8943a;font-weight:700}
+#cam-box{width:220px;height:126px;margin:8px 0 0;background:#0c0c0c;border:1px solid rgba(150,150,150,0.3);border-radius:3px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
+#cam-box img{width:220px;height:126px;object-fit:cover;opacity:0.92}
+#cam-err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#ff6b81;font-size:10px;text-align:center;background:rgba(0,0,0,0.65)}
 #status .warn{color:#e8483a}
 #status .ok{color:#3ac8a0}
 #uspanel{position:fixed;bottom:8px;left:8px;z-index:1000;background:rgba(0,0,0,0.82);
@@ -54,7 +57,7 @@ body{background:#000;overflow:hidden;font:12px 'Segoe UI',system-ui,sans-serif}
   <div>HackRF: <span class="val ok" id="st-hrf">--</span></div>
   <div>RTL-SDR: <span class="val ok" id="st-rtl">--</span></div>
   <div>Petterson: <span class="val ok" id="st-pet">--</span></div>
-    <div id="cam-box" style="margin:8px 0 0"><img id="cam-preview" src="/camera/snap?t=1" style="width:220px;height:auto;border:1px solid rgba(150,150,150,0.3);border-radius:3px;opacity:0.92" /><div id="cam-err" style="display:none;color:#ff6b81;font-size:10px;margin-top:3px">camera unavailable</div></div>
+    <div id="cam-box"><img id="cam-preview" alt="camera" src="/camera/snap?t=1" /><div id="cam-err">camera unavailable</div></div>
 </div>
 
 <div id="uspanel">
@@ -129,7 +132,6 @@ function fetchAddr(lat,lon,el){
 }
 
 function update() {
-  fetch('/camera/snap').then(function(r){if(r.ok){var img=document.getElementById('cam-preview');img.src='/camera/snap?'+Date.now()}}).catch(function(){});
   fetch('/api/detections').then(function(r){return r.json()}).then(function(d){
     var sources = d.sources || [];
     var obs = d.observer || {};
@@ -313,15 +315,15 @@ function drawSpec(canvas, spec, histKey, markers, maxF){
 
 update();
 setInterval(update, 4000);
-// Live camera: refresh every 3s, retry on error (never hide permanently)
+// Live camera: refresh every 3s, retry on error (box is fixed-size, never flashes)
 var _camFails=0;
-setInterval(function(){
+(function(){
   var im=document.getElementById('cam-preview'), er=document.getElementById('cam-err');
   if(!im) return;
-  im.onerror=function(){ _camFails++; if(er){er.style.display='block';} };
+  im.onerror=function(){ _camFails++; if(er){er.style.display='flex';} };
   im.onload=function(){ _camFails=0; if(er){er.style.display='none';} };
-  im.src='/camera/snap?t='+Date.now();
-}, 3000);
+  setInterval(function(){ im.src='/camera/snap?t='+Date.now(); }, 3000);
+})();
 
 document.addEventListener('keydown',function(e){
   if(e.key==='r') update();

@@ -1,0 +1,35 @@
+; NESDR (RTL-SDR) WinUSB driver - replaces the broken DVB-T driver binding.
+; Standard WinUSB include pattern (winusb.inf is inbox + signed).
+; Install:  pnputil /add-driver nesdr_winusb.inf /install   (from an ADMIN terminal)
+; This is exactly what Zadig does; no reboot required.
+[Version]
+Signature="$Windows NT$"
+Class=USBDevice
+ClassGuid={88bae032-5a81-49f0-bc3d-a4ff138216d6}
+Provider=%Provider%
+DriverVer=08/09/2026,1.0.0.0
+
+[Manufacturer]
+%Mfg%=DevList,NTamd64
+
+[DevList.NTamd64]
+%NESDR.DeviceDesc%=NESDR_Install, USB\VID_0BDA&PID_2838&MI_00
+%NESDR.DeviceDesc2%=NESDR_Install, USB\VID_0BDA&PID_2838&MI_01
+
+[NESDR_Install.NT]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[NESDR_Install.NT.HW]
+Include=winusb.inf
+Needs=WINUSB.NT.HW
+
+[NESDR_Install.NT.Services]
+Include=winusb.inf
+Needs=WINUSB.NT.Services
+
+[Strings]
+Provider="TSCM"
+Mfg="TSCM"
+NESDR.DeviceDesc="Nooelec NESDR Smart (WinUSB)"
+NESDR.DeviceDesc2="Nooelec NESDR Smart (WinUSB) IF1"

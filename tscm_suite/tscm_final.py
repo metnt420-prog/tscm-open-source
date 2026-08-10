@@ -4898,7 +4898,9 @@ class MapHandler(BaseHTTPRequestHandler):
                 self.send_error(403); return
             import time as _t
             _now = _t.time()
-            _cstate = getattr(self, '_camera_state', {'last_probe': 0})
+            # Class-level timestamp: BaseHTTPRequestHandler instances are per-
+            # connection, so instance attrs are useless for rate limiting.
+            _cstate = getattr(MapHandler, '_camera_state', {'last_probe': 0})
             # The suite process NEVER opens the camera directly: the broken
             # NVIDIA Broadcast virtual cam corrupts the process heap
             # (STATUS_HEAP_CORRUPTION crash-loop 2026-08-09). Capture runs in a
@@ -4914,7 +4916,7 @@ class MapHandler(BaseHTTPRequestHandler):
             # kick a probe if none ran in the last 60s (child process, safe)
             if _now - _cstate['last_probe'] >= 60:
                 _cstate['last_probe'] = _now
-                self._camera_state = _cstate
+                MapHandler._camera_state = _cstate
                 try:
                     import subprocess as _sp
                     _sp.Popen([sys.executable, r'C:\Users\carpe\.openclaw-autoclaw\workspace\camera_probe.py'],
@@ -5308,6 +5310,8 @@ class MapHandler(BaseHTTPRequestHandler):
 class LiveMapServer:
     def __init__(self, port=8080): self.port = port; self.server = None; self.thread = None
     def start(self):
+        if self.server is not None:
+            return  # idempotent: run() calls start() twice (bind once only)
         self.server = ThreadingHTTPServer(('127.0.0.1', self.port), MapHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
