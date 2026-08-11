@@ -119,6 +119,11 @@ html,body{width:100%;height:100%;background:var(--bg);color:var(--text);font-fam
 
 <button id="toggle-btn" onclick="toggleOverlays()">FULL MAP</button>
 
+<div style="position:fixed;left:50%;top:50%;transform:translate(-50%,50px);z-index:9;display:flex;gap:4px" class="overlay" id="zoom-ctrls">
+  <button onclick="zoomMap(-1)" style="background:var(--panel);border:1px solid var(--border);color:var(--muted);font-family:var(--fn);font-size:16px;width:32px;height:32px;cursor:pointer;border-radius:1px;line-height:1;backdrop-filter:blur(12px);transition:all 0.2s" title="Zoom out">-</button>
+  <button onclick="zoomMap(1)" style="background:var(--panel);border:1px solid var(--border);color:var(--muted);font-family:var(--fn);font-size:16px;width:32px;height:32px;cursor:pointer;border-radius:1px;line-height:1;backdrop-filter:blur(12px);transition:all 0.2s" title="Zoom in">+</button>
+</div>
+
 <div id="controls" class="overlay">
   <button onclick="jammer('auto')" id="btn-auto">AUTO</button>
   <button onclick="jammer('enable')" id="btn-on">ON</button>
@@ -137,7 +142,7 @@ html,body{width:100%;height:100%;background:var(--bg);color:var(--text);font-fam
 (function(){
 'use strict';
 var API=window.location.origin, INTERVAL=3000, MAP_INTERVAL=8000;
-var latestData=null, mapEl=document.getElementById('map-img'), mapTs=0, panelsHidden=false;
+var latestData=null, mapEl=document.getElementById('map-img'), mapTs=0, panelsHidden=false, currentZoom=12;
 
 function $(id){return document.getElementById(id)}
 function t(id,text){var e=$(id);if(e)e.textContent=text}
@@ -157,10 +162,15 @@ function jammer(action){
   if(action==='disable')document.getElementById('btn-off').className='active';
 }
 
+function zoomMap(delta){
+  currentZoom=Math.max(8,Math.min(20,currentZoom+delta));
+  refreshMap();
+}
 function refreshMap(){
-  var src=API+'/map.png?'+Date.now();
+  var src=API+'/map.png?z='+currentZoom+'&'+Date.now();
   var img=new Image();
   img.onload=function(){mapEl.src=src;mapTs=Date.now()};
+  img.onerror=function(){currentZoom=14;setTimeout(refreshMap,1000)};
   img.src=src;
 }
 
