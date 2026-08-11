@@ -86,3 +86,13 @@ TSCM_24H_REPORT.md
 TSCM_COMPLETE_ARCHIVE.html
 LEGAL_COVER_SHEET.txt
 evidence-repo/
+
+# temp/test/diagnostic files
+_*.ps1
+_*.txt
+_*.json
+*.log
+launcher_v5_stdout.log
+launcher_v5_stderr.log
+test_*.py
+TSCM_README.md

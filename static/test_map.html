@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Map Test</title>
+<link rel="stylesheet" href="./static/leaflet.css?tscm3">
+<style>body{margin:0;padding:0}#map{width:100vw;height:100vh;background:#112}</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="./static/leaflet.js?tscm3"></script>
+<script>
+console.log('Leaflet version:', L.version);
+try {
+  var m = L.map('map', {center:[41.513,-88.133], zoom:15});
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+  }).addTo(m);
+  L.circleMarker([41.513,-88.133], {radius:10,color:'red'}).addTo(m);
+  console.log('Map created OK');
+  setTimeout(function(){ m.invalidateSize(); console.log('invalidated'); }, 1000);
+} catch(e) {
+  console.error('Map error:', e);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TSCM · QUAD RF v3</title>
+<link rel="stylesheet" href="./static/leaflet.css?tscm3">
+<style>
+:root{--bg:#060608;--sf:#0c0c12;--bd:rgba(200,140,50,0.12);--tx:#c8b080;--mu:rgba(180,140,80,0.40);--ac:#d08828;--fn:'Courier New',monospace}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:var(--bg);color:var(--tx);font-family:var(--fn);overflow:hidden}
+#main{position:fixed;inset:4px 4px 22px 4px;display:grid;grid-template-columns:1fr 1fr;gap:4px;z-index:1}
+.panel{background:var(--sf);border:1px solid var(--bd);border-radius:2px;display:flex;flex-direction:column;overflow:hidden}
+.hdr{padding:4px 8px;border-bottom:1px solid var(--bd);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--mu);flex-shrink:0;background:rgba(200,140,50,0.03);display:flex;justify-content:space-between}
+.hdr .t{color:var(--ac);font-weight:600}
+.body{flex:1;position:relative;overflow:hidden}
+#cam-box{position:relative;width:100%;height:100%}
+#cam-img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+#rf-cv{position:absolute;inset:0;width:100%;height:100%;z-index:10;pointer-events:none}
+.cam-c{position:absolute;inset:0;z-index:20;pointer-events:none}
+.cam-c::before,.cam-c::after{content:'';position:absolute;width:18px;height:18px;border-color:rgba(200,140,50,0.30);border-style:solid}
+.cam-c::before{top:3px;left:3px;border-width:1px 0 0 1px}
+.cam-c::after{bottom:3px;right:3px;border-width:0 1px 1px 0}
+#map{width:100%;height:100%;background:#1a1a2e}
+#bar{position:fixed;bottom:4px;left:4px;right:4px;z-index:100;display:flex;justify-content:space-between;align-items:center;padding:3px 8px;background:var(--sf);border:1px solid var(--bd);font-size:8px;color:var(--mu);gap:8px;font-family:var(--fn)}
+#bar span{white-space:nowrap}
+.dt{width:5px;height:5px;border-radius:50%;background:rgba(180,140,80,0.15);flex-shrink:0}
+.dt.ok{background:#289080}
+#ld{position:fixed;inset:0;z-index:10000;background:var(--bg);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;transition:opacity 0.3s}
+#ld.hide{opacity:0;pointer-events:none}
+#ld .sp{width:22px;height:22px;border:2px solid rgba(180,140,80,0.1);border-top-color:var(--ac);border-radius:50%;animation:rot 0.7s linear infinite}
+@keyframes rot{to{transform:rotate(360deg)}}
+#ld .msg{font-size:10px;color:var(--mu);letter-spacing:0.05em}
+#db{position:absolute;top:34px;left:4px;z-index:30;color:#fff;font:9px monospace;pointer-events:none;background:rgba(0,0,0,0.75);padding:2px 6px;max-width:90%}
+</style>
+</head>
+<body>
+<div id="ld"><div class="sp"></div><div class="msg">QUAD RF · INITIALIZING</div></div>
+<div id="main">
+  <div class="panel">
+    <div class="hdr"><span class="t">▸ QUAD RF VISUALIZER</span><span id="hc">--</span></div>
+    <div class="body"><div id="cam-box"><div id="db">WAIT</div><img id="cam-img" alt="RF Camera"><canvas id="rf-cv"></canvas><div class="cam-c"></div><div id="lg" style="position:absolute;top:6px;right:8px;z-index:25;font-size:7px;pointer-events:none;text-align:right;line-height:1.6"></div></div></div>
+  </div>
+  <div class="panel">
+    <div class="hdr"><span class="t">▸ SIGNAL MAP</span><span id="hm">--</span></div>
+    <div class="body"><div id="map"></div></div>
+  </div>
+</div>
+<div id="bar">
+  <span><span class="dt" id="da"></span>API</span>
+  <span><span class="dt" id="dc"></span>CAM</span>
+  <span id="bs">SRC --</span>
+  <span id="ba">AoA --</span>
+  <span id="bp">POS --</span>
+  <span id="bu">US --</span>
+  <span id="bm">C2 --</span>
+  <span id="bt">--</span>
+</div>
+<script src="./static/leaflet.js?tscm3"></script>
+<script>
+(function(){'use strict';
+var API=window.location.origin, HOME=[41.513181,-88.133708], P=3000, CP=6000;
+var mm=null, mk={}, latest=null, rc, ctx, rw, rh, camBlob=null;
+function $(id){return document.getElementById(id)}
+function tx(id,t){var e=$(id);if(e)e.textContent=t}
+function dt(id,c){var e=$(id);if(e)e.className='dt '+(c||'')}
+
+// Camera
+function cam(){fetch(API+'/camera/snap?'+Date.now(),{signal:AbortSignal.timeout(8000)}).then(function(r){return r.blob()}).then(function(b){if(b&&b.size>1000){if(camBlob)URL.revokeObjectURL(camBlob);camBlob=URL.createObjectURL(b);$('cam-img').src=camBlob;tx('hc','LIVE');dt('dc','ok')}else{tx('hc','EMPTY')}}).catch(function(){tx('hc','DOWN')})}
+
+// RF Canvas init with fallback sizing
+function rfI(){try{rc=$('rf-cv');if(!rc)return;ctx=rc.getContext('2d');function rs(){var b=$('cam-box'),img=$('cam-img');var ww=0,hh=0;if(b){var r=b.getBoundingClientRect();ww=r.width;hh=r.height}if(ww<10&&img&&img.naturalWidth){ww=img.naturalWidth;hh=img.naturalHeight}if(ww<10){ww=500;hh=375}rc.width=ww;rc.height=hh;rw=ww;rh=hh};rs();window.addEventListener('resize',rs);setTimeout(rs,300);setTimeout(rs,1000);setTimeout(rs,3000);setTimeout(rs,8000)}catch(e){console.error('rfI:',e)}}
+
+function rfD(){
+ if(!rw||!rh||rw<10){var b=$('cam-box'),img=$('cam-img');if(b){var r=b.getBoundingClientRect();rw=r.width;rh=r.height;rc.width=rw;rc.height=rh}if(rw<10&&img&&img.naturalWidth){rw=img.naturalWidth;rh=img.naturalHeight;rc.width=rw;rc.height=rh}if(rw<10){rw=500;rh=375;rc.width=rw;rc.height=rh}}
+ if(!ctx||!rw||!rh||rw<10)return;
+ var w=rw,h=rh,cx=w/2,cy=h/2,rad=Math.min(w,h)*0.44;
+ ctx.clearRect(0,0,w,h);
+
+ // Corner markers
+ ctx.fillStyle='#ff4400';ctx.fillRect(0,0,30,30);
+ ctx.fillStyle='#44ff00';ctx.fillRect(w-30,0,30,30);
+ ctx.fillStyle='#4488ff';ctx.fillRect(0,h-30,30,30);
+ ctx.fillStyle='#ffee00';ctx.fillRect(w-30,h-30,30,30);
+
+ if(!latest||!latest.sources){ctx.fillStyle='#ff4400';ctx.font='bold 16px monospace';ctx.textAlign='center';ctx.fillText('WAITING FOR DATA',cx,cy);return}
+
+ // Build bearing maps
+ var posB={}, usB={}, allB={};
+ if(latest.sources){latest.sources.forEach(function(s){
+  var br=s.bearing;if(!br||br===0)return;
+  var bk=Math.round(br);
+  // Positioned sources
+  if(s.lat&&s.lon){
+   var db=Math.round(Math.atan2(s.lon-HOME[1],s.lat-HOME[0])*180/Math.PI);
+   if(!posB[db]||(s.freq||0)>(posB[db].freq||0))posB[db]=s;
+  }
+  // Ultrasound modem sources (c2, bpsk, fsk, silent_sound)
+  if(s.detector&&(s.detector.indexOf('us_bpsk')>=0||s.detector.indexOf('us_modem')>=0||s.detector.indexOf('c2_c2')>=0||s.detector.indexOf('silent_sound')>=0||s.detector.indexOf('voice_to')>=0)){
+   if(!usB[bk]||(s.freq||0)>(usB[bk].freq||0))usB[bk]=s;
+  }
+  // All other bearing sources (aggregate)
+  if(!allB[bk])allB[bk]={count:0,tx:0,vic:0,freqs:[]};
+  allB[bk].count++;
+  if(s.classification==='transmitter')allB[bk].tx++;
+  else if(s.classification==='victim')allB[bk].vic++;
+  if(s.freq>0)allB[bk].freqs.push(s.freq);
+ })}
+
+ // Ring
+ ctx.strokeStyle='rgba(200,140,50,0.15)';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(cx,cy,rad,0,Math.PI*2);ctx.stroke();
+ ctx.strokeStyle='rgba(200,140,50,0.08)';ctx.lineWidth=0.5;ctx.beginPath();ctx.arc(cx,cy,rad*0.55,0,Math.PI*2);ctx.stroke();
+
+ // Ticks + cardinals
+ for(var i=0;i<360;i+=15){
+  var a=i*Math.PI/180, isMaj=i%30===0;
+  ctx.strokeStyle=isMaj?'rgba(200,140,50,0.25)':'rgba(200,140,50,0.10)';
+  ctx.lineWidth=isMaj?1:0.5;
+  ctx.beginPath();ctx.moveTo(cx+Math.sin(a)*rad*0.9,cy-Math.cos(a)*rad*0.9);ctx.lineTo(cx+Math.sin(a)*rad,cy-Math.cos(a)*rad);ctx.stroke();
+  if(isMaj){
+   ctx.fillStyle='rgba(200,140,80,0.45)';ctx.font='bold 10px monospace';ctx.textAlign='center';
+   var dirs={0:'N',90:'E',180:'S',270:'W'};var d=dirs[i]||'';
+   ctx.fillText(d,cx+Math.sin(a)*(rad+13),cy-Math.cos(a)*(rad+13)+4);
+  }
+ }
+
+ // === DRAW AGGREGATE BEARING HEAT (gray density lines) ===
+ Object.keys(allB).forEach(function(k){
+  var b=parseFloat(k),info=allB[k],ra=b*Math.PI/180;
+  var alpha=Math.min(0.4,info.count*0.03);
+  ctx.strokeStyle='rgba(200,200,200,'+alpha.toFixed(2)+')';
+  ctx.lineWidth=Math.min(6,1+info.count*0.3);
+  ctx.beginPath();ctx.moveTo(cx+Math.sin(ra)*rad*0.5,cy-Math.cos(ra)*rad*0.5);
+  ctx.lineTo(cx+Math.sin(ra)*rad,cy-Math.cos(ra)*rad);ctx.stroke();
+ });
+
+ // === US MODEM BEARINGS (GREEN/BLUE — the real C2 direction) ===
+ Object.keys(usB).forEach(function(k){
+  var s=usB[k],b=parseFloat(k),ra=b*Math.PI/180;
+  // Solid green line for US modem
+  ctx.strokeStyle='rgba(0,255,180,0.7)';ctx.lineWidth=3;
+  ctx.setLineDash([]);
+  ctx.beginPath();ctx.moveTo(cx+Math.sin(ra)*rad*0.55,cy-Math.cos(ra)*rad*0.55);
+  ctx.lineTo(cx+Math.sin(ra)*rad,cy-Math.cos(ra)*rad);ctx.stroke();
+  // Big green dot
+  var sx=cx+Math.sin(ra)*(rad-6),sy=cy-Math.cos(ra)*(rad-6);
+  ctx.fillStyle='rgba(0,255,180,0.85)';ctx.beginPath();ctx.arc(sx,sy,8,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+  // Label
+  ctx.fillStyle='#00ffb4';ctx.font='bold 10px monospace';ctx.textAlign='center';
+  var fn=s.detector?s.detector.replace(/_/g,' ').substring(0,18):(s.freq/1000).toFixed(0)+'kHz';
+  ctx.fillText(fn+' '+b+'°',cx+Math.sin(ra)*(rad+24),cy-Math.cos(ra)*(rad+24)+3);
+ });
+
+ // === POSITIONED SOURCES (GOLD/RED) ===
+ Object.keys(posB).forEach(function(k){
+  var s=posB[k],b=parseFloat(k),ra=b*Math.PI/180;
+  var isTX=s.classification==='transmitter',col=isTX?'rgba(255,200,80,0.95)':'rgba(255,130,130,0.8)';
+  ctx.strokeStyle=isTX?'rgba(255,200,80,0.35)':'rgba(255,130,130,0.20)';ctx.lineWidth=isTX?2:1;
+  ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.sin(ra)*rad,cy-Math.cos(ra)*rad);ctx.stroke();
+  var sx=cx+Math.sin(ra)*(rad-12),sy=cy-Math.cos(ra)*(rad-12);
+  ctx.fillStyle=col;ctx.beginPath();ctx.arc(sx,sy,isTX?6:4,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle=col;ctx.font='bold 8px monospace';ctx.textAlign='center';
+  var fl=s.freq>=1e9?(s.freq/1e9).toFixed(1)+'G':s.freq>=1e6?(s.freq/1e6).toFixed(0)+'M':(s.freq/1000).toFixed(0)+'k';
+  ctx.fillText(fl+' '+b+'°',cx+Math.sin(ra)*(rad+20),cy-Math.cos(ra)*(rad+20)+3);
+ });
+
+ // AoA line
+ var aoa=latest.observer?latest.observer.aoa:null;
+ if(aoa!=null){
+  var aa=aoa*Math.PI/180;
+  ctx.strokeStyle='rgba(208,136,40,0.5)';ctx.lineWidth=2;ctx.setLineDash([8,6]);ctx.beginPath();
+  ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.sin(aa)*rad,cy-Math.cos(aa)*rad);ctx.stroke();ctx.setLineDash([]);
+  var adx=cx+Math.sin(aa)*rad*0.8,ady=cy-Math.cos(aa)*rad*0.8;
+  ctx.fillStyle='rgba(208,136,40,0.5)';ctx.beginPath();ctx.arc(adx,ady,8,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#ffc040';ctx.beginPath();ctx.arc(adx,ady,4,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#ffc040';ctx.font='bold 9px monospace';ctx.textAlign='center';
+  ctx.fillText('AoA '+aoa.toFixed(0),cx+Math.sin(aa)*(rad+24),cy-Math.cos(aa)*(rad+24)+3);
+ }
+
+ // Crosshair
+ ctx.strokeStyle='rgba(200,140,50,0.5)';ctx.lineWidth=1;
+ ctx.beginPath();ctx.moveTo(cx-14,cy);ctx.lineTo(cx+14,cy);ctx.stroke();
+ ctx.beginPath();ctx.moveTo(cx,cy-14);ctx.lineTo(cx,cy+14);ctx.stroke();
+
+ // Legend
+ var ptx=0,pvic=0;Object.keys(posB).forEach(function(k){var c=posB[k].classification;if(c==='transmitter')ptx++;else if(c==='victim')pvic++});
+ $('lg').innerHTML=
+  '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(255,200,80,0.9);vertical-align:middle;margin-right:4px"></span>TX '+ptx+'</div>'+
+  '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(255,130,130,0.8);vertical-align:middle;margin-right:4px"></span>V '+pvic+'</div>'+
+  '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#00ffb4;vertical-align:middle;margin-right:4px"></span>C2 MODEM '+(Object.keys(usB).length||0)+'</div>';
+
+ // Debug
+ var db='CANVAS '+w+'x'+h+' | RF rendered';
+ if(latest){db+=' | SRC='+(latest.sources||[]).length;if(latest.observer)db+=' AoA='+(latest.observer.aoa||0).toFixed(0)+'°'}
+ tx('db',db);
+}
+
+// Map
+function mapI(){var dbg=$('db');try{dbg.textContent='MAP:init...';mm=L.map('map',{center:HOME,zoom:15,zoomControl:false,attributionControl:false});dbg.textContent='MAP:layers...';L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,errorTileUrl:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='}).addTo(mm);L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:18}).addTo(mm);L.circleMarker(HOME,{radius:6,fillColor:'#d08828',color:'#d08828',weight:1.5,opacity:0.9,fillOpacity:0.9}).addTo(mm).bindTooltip('OBSERVER');dbg.textContent='MAP:OK v'+L.version;setTimeout(function(){if(mm){mm.invalidateSize();dbg.textContent+=' size:'+$('map').offsetWidth+'x'+$('map').offsetHeight}},500);window.addEventListener('resize',function(){if(mm)mm.invalidateSize()})}catch(e){console.error('Map init:',e);$('db').textContent='MAP:ERR '+e.message}}
+function mapU(d){if(!mm||!d||!d.sources)return;var ak={},p=0;d.sources.forEach(function(s){if(!s.lat||!s.lon)return;p++;var k=s.lat.toFixed(6)+','+s.lon.toFixed(6);ak[k]=true;if(mk[k]){mk[k].setLatLng([s.lat,s.lon])}else{var col=s.classification==='transmitter'?'#d4a860':s.classification==='victim'?'#d47373':'#888';mk[k]=L.circleMarker([s.lat,s.lon],{radius:s.classification==='transmitter'?8:5,fillColor:col,color:col,weight:1,opacity:0.85,fillOpacity:0.45}).addTo(mm).bindTooltip((s.detector||'').replace(/_/g,' ').substring(0,20))}});for(var k in mk){if(!ak[k]){mm.removeLayer(mk[k]);delete mk[k]}};tx('hm',p+' PINNED')}
+
+// Poll
+function poll(){fetch(API+'/api/detections',{signal:AbortSignal.timeout(5000)}).then(function(r){if(!r.ok)throw new Error(r.status);return r.json()}).then(function(d){latest=d;dt('da','ok');
+ var n=(d.sources||[]).length, pos=0, us=0, c2=0;
+ if(d.sources){d.sources.forEach(function(s){
+  if(s.lat&&s.lon)pos++;
+  if(s.freq>=18000&&s.freq<=48000)us++;
+  if(s.detector&&(s.detector.indexOf('us_bpsk')>=0||s.detector.indexOf('us_modem')>=0||s.detector.indexOf('c2_c2')>=0))c2++;
+ })}
+ tx('bs','SRC '+n);tx('bp','POS '+pos);tx('bu','US '+us);tx('bm','C2 '+c2);
+ if(d.observer&&d.observer.aoa!=null)tx('ba','AoA '+d.observer.aoa.toFixed(0)+'°');
+ mapU(d);rfD();tx('bt',new Date().toLocaleTimeString())}).catch(function(e){dt('da',null);tx('db','API: '+e.message)})}
+
+function init(){try{rfI()}catch(e){};try{mapI()}catch(e){console.error('mapI:',e)};cam();poll();$('ld').classList.add('hide');setInterval(poll,P);setInterval(cam,CP)}
+window.addEventListener('load',init);
+// Aggressive overlay removal (backup in case init fails)
+setTimeout(function(){$('ld').classList.add('hide')},2000);
+setTimeout(function(){$('ld').classList.add('hide')},5000);
+})();
+</script>
+</body>
+</html>
