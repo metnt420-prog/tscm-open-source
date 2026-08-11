@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TSCM · Live</title>
+<!--
+  11 Build — Luxury Minimalism
+  70%+ breathing room, single amber accent, weight contrast 200-600
+-->
+<style>
+:root {
+  --bg: #0a0a0f;
+  --panel: rgba(12,12,20,0.92);
+  --border: rgba(200,148,46,0.08);
+  --text: #b8a898;
+  --muted: rgba(180,148,96,0.35);
+  --accent: #c8962e;
+  --accent-dim: rgba(200,148,46,0.18);
+  --green: #487a68;
+  --red: #8b4040;
+  --red-bright: #c04040;
+  --fn: 'Courier New', monospace;
+  --gap: 16px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:var(--bg);color:var(--text);font-family:var(--fn);overflow:hidden;-webkit-font-smoothing:antialiased}
+
+/* Map — full bleed background */
+#map-bg{position:fixed;inset:0;z-index:1}
+#map-bg img{width:100%;height:100%;object-fit:cover}
+
+/* Loading overlay */
+#loader{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;align-items:center;justify-content:center;transition:opacity 0.5s}
+#loader.hide{opacity:0;pointer-events:none}
+#loader .ring{width:28px;height:28px;border:1.5px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loader .msg{margin-top:14px;font-size:10px;color:var(--muted);letter-spacing:0.08em}
+
+/* Status panel — top-left, floating, ultra-minimal */
+#status{position:fixed;top:var(--gap);left:var(--gap);z-index:10;background:var(--panel);border:1px solid var(--border);border-radius:1px;padding:14px 18px;min-width:180px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+#status h1{font-size:11px;font-weight:400;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px}
+#status h1 span{color:var(--accent);font-weight:600}
+#status .row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:10px;gap:20px}
+#status .row .l{color:var(--muted);font-weight:300}
+#status .row .v{color:var(--text);font-weight:600;text-align:right}
+#status .row .v.good{color:var(--green)}
+#status .row .v.warn{color:var(--accent)}
+#status .row .v.bad{color:var(--red-bright)}
+
+/* Threats panel — top-right */
+#threats{position:fixed;top:var(--gap);right:var(--gap);z-index:10;background:var(--panel);border:1px solid var(--border);border-radius:1px;padding:14px 18px;min-width:200px;max-width:260px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+#threats h2{font-size:11px;font-weight:400;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px}
+#threats h2 span{color:var(--red-bright);font-weight:600}
+#threats .t{display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:9px;gap:12px}
+#threats .t .n{color:var(--red-bright);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#threats .t .c{color:var(--muted);font-weight:300;flex-shrink:0}
+#threats .empty{font-size:9px;color:var(--muted);font-style:italic;padding:4px 0}
+
+/* Detection feed — bottom-left */
+#feed{position:fixed;bottom:var(--gap);left:var(--gap);z-index:10;background:var(--panel);border:1px solid var(--border);border-radius:1px;padding:12px 18px;max-width:320px;max-height:160px;overflow-y:auto;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+#feed h3{font-size:10px;font-weight:400;color:var(--muted);letter-spacing:0.08em;text-transform:uppercase;margin-bottom:8px;position:sticky;top:0;background:var(--panel);padding-bottom:4px}
+#feed .item{font-size:9px;padding:3px 0;border-bottom:1px solid rgba(200,148,46,0.04);display:flex;gap:10px}
+#feed .item .det{color:var(--accent);font-weight:600;flex-shrink:0;min-width:80px}
+#feed .item .inf{color:var(--muted);font-weight:300}
+
+/* Bottom bar */
+#bar{position:fixed;bottom:0;left:0;right:0;z-index:10;background:rgba(10,10,15,0.85);border-top:1px solid var(--border);padding:3px 16px;display:flex;justify-content:space-between;align-items:center;font-size:9px;color:var(--muted);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+#bar span{color:var(--text);font-weight:400;margin-left:18px}
+#bar .pulse{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--green);margin-right:4px;animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.25}}
+#bar .pulse.off{background:var(--red-bright);animation:none}
+
+/* Control — bottom-right */
+#controls{position:fixed;bottom:var(--gap);right:var(--gap);z-index:10;display:flex;gap:8px}
+#controls button{background:var(--panel);border:1px solid var(--border);color:var(--muted);font-family:var(--fn);font-size:9px;padding:6px 12px;cursor:pointer;border-radius:1px;transition:all 0.2s;letter-spacing:0.05em}
+#controls button:hover{border-color:var(--accent-dim);color:var(--accent)}
+#controls button.active{border-color:var(--accent);color:var(--accent);font-weight:600}
+
+/* Responsive — mobile */
+@media(max-width:768px){
+  #status,#threats,#feed{position:static;margin:4px;max-width:none;border-radius:1px}
+  #map-bg{position:static;height:50vh}
+  #controls{position:static;margin:4px;justify-content:flex-end}
+  #bar{flex-wrap:wrap;gap:4px;padding:4px 8px}
+}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border)}
+</style>
+</head>
+<body>
+
+<div id="loader"><div class="ring"></div><div class="msg">INITIALIZING</div></div>
+
+<!-- Live server-rendered map -->
+<div id="map-bg"><img id="map-img" alt="TSCM Map" onload="document.getElementById('loader').classList.add('hide')" onerror="this.src=this.src"></div>
+
+<!-- Equipment Status -->
+<div id="status">
+  <h1><span>▸</span> Equipment</h1>
+  <div class="row"><span class="l">BladeRF xA9</span><span class="v" id="s-blade">--</span></div>
+  <div class="row"><span class="l">HackRF One</span><span class="v" id="s-hack">--</span></div>
+  <div class="row"><span class="l">RTL-SDR</span><span class="v" id="s-rtl">--</span></div>
+  <div class="row"><span class="l">GPS</span><span class="v" id="s-gps">--</span></div>
+  <div class="row"><span class="l">Jammer</span><span class="v" id="s-jammer">--</span></div>
+  <div class="row"><span class="l">Sources</span><span class="v" id="s-count">--</span></div>
+  <div class="row"><span class="l">AoA</span><span class="v" id="s-aoa">--</span></div>
+</div>
+
+<!-- Active Threats -->
+<div id="threats">
+  <h2><span>▸</span> Threats Active</h2>
+  <div id="t-list"><div class="empty">scanning...</div></div>
+</div>
+
+<!-- Detection Feed -->
+<div id="feed">
+  <h3>Detection Feed</h3>
+  <div id="f-list"></div>
+</div>
+
+<!-- Jammer Controls -->
+<div id="controls">
+  <button onclick="jammer('auto')" id="btn-auto">AUTO</button>
+  <button onclick="jammer('enable')" id="btn-on">ON</button>
+  <button onclick="jammer('disable')" id="btn-off">OFF</button>
+</div>
+
+<!-- Bottom Bar -->
+<div id="bar">
+  <span id="b-time">--:--:--</span>
+  <span id="b-beat">Beats: --</span>
+  <span id="b-attacks">Attacks: --</span>
+  <span id="b-update">Updated: --</span>
+</div>
+
+<script>
+(function(){
+'use strict';
+var API=window.location.origin, INTERVAL=3000, MAP_INTERVAL=8000;
+var latestData=null, mapEl=document.getElementById('map-img'), mapTs=0;
+
+function $(id){return document.getElementById(id)}
+function t(id,text){var e=$(id);if(e)e.textContent=text}
+function cl(el,c){el.className=c}
+
+// Equipment status indicators
+function eq(name,val){var el=$(name);if(!el)return;
+  if(val===true||val==='ON'||val==='ENABLED'){t(name,'ONLINE');cl(el,'v good')}
+  else if(val===false||val==='OFF'||val==='DISABLED'){t(name,'OFFLINE');cl(el,'v bad')}
+  else{t(name,String(val));cl(el,'v')}
+}
+
+// Jammer control
+function jammer(action){
+  fetch(API+'/api/jammer?action='+action,{signal:AbortSignal.timeout(3000)})
+    .catch(function(){});
+  document.querySelectorAll('#controls button').forEach(function(b){b.className=''});
+  if(action==='auto')document.getElementById('btn-auto').className='active';
+  if(action==='enable')document.getElementById('btn-on').className='active';
+  if(action==='disable')document.getElementById('btn-off').className='active';
+}
+
+// Refresh map image
+function refreshMap(){
+  var src=API+'/map.png?'+Date.now();
+  var img=new Image();
+  img.onload=function(){mapEl.src=src;mapTs=Date.now()};
+  img.src=src;
+}
+
+// Build threat list
+function buildThreats(sources){
+  var threats={}, list=[];
+  if(!sources){document.getElementById('t-list').innerHTML='<div class="empty">no data</div>';return}
+  sources.forEach(function(s){
+    var d=s.detector||'unknown';
+    if(d.indexOf('c2_')===0||d.indexOf('wifi_c2')===0||
+       d==='silent_sound'||d==='mw_voice_carrier'||
+       d==='carbon_interaction'||d==='radar_water_body'||
+       d==='real_transmitter'||d==='parametric_attack_confirmed'||
+       d==='injection_locking'||d==='wifi_wifi_approaching'){
+      if(!threats[d])threats[d]={count:0,threat:0};
+      threats[d].count++;
+      if(s.threat_level>0)threats[d].threat=Math.max(threats[d].threat,s.threat_level);
+    }
+  });
+  Object.keys(threats).sort(function(a,b){return threats[b].threat-threats[a].threat||threats[b].count-threats[a].count}).forEach(function(k){
+    var name=k.replace(/_/g,' ').substring(0,22);
+    list.push('<div class="t"><span class="n">'+name+'</span><span class="c">x'+threats[k].count+'</span></div>');
+  });
+  document.getElementById('t-list').innerHTML=list.length?list.join(''):'<div class="empty">none detected</div>';
+}
+
+// Build detection feed
+function buildFeed(sources){
+  if(!sources){return}
+  var items=[], shown=0;
+  sources.forEach(function(s){
+    if(shown>=8)return;
+    var d=s.detector||'unknown';
+    var freq=s.frequency_hz||s.freq||0;
+    var fs=freq>=1e9?(freq/1e9).toFixed(1)+'G':freq>=1e6?(freq/1e6).toFixed(0)+'M':freq>=1000?(freq/1000).toFixed(0)+'k':'';
+    var info=fs;
+    if(s.bearing)info+=' '+Math.round(s.bearing)+'\u00B0';
+    if(s.range)info+=' '+Math.round(s.range)+'m';
+    items.push('<div class="item"><span class="det">'+d.substring(0,18)+'</span><span class="inf">'+info+'</span></div>');
+    shown++;
+  });
+  document.getElementById('f-list').innerHTML=items.join('');
+}
+
+// Main poll
+function poll(){
+  fetch(API+'/api/detections',{signal:AbortSignal.timeout(5000)})
+   .then(function(r){if(!r.ok)throw new Error(r.status);return r.json()})
+   .then(function(d){
+    latestData=d;
+    var obs=d.observer||{}, sources=d.sources||[];
+    var n=sources.length;
+    var aoa=obs.aoa!=null?Math.round(obs.aoa):null;
+    var beatPairs=sources.filter(function(s){return s.detector==='parametric_beat_pair'}).length;
+    var attacks=sources.filter(function(s){return s.detector==='parametric_attack_confirmed'}).length;
+
+    // Equipment
+    eq('s-blade',obs.bladerf);
+    eq('s-hack',obs.hackrf);
+    eq('s-rtl',obs.rtlsdr);
+    eq('s-gps',obs.gps_fix);
+    t('s-count',n);
+    if(aoa!=null)t('s-aoa',aoa+'\u00B0');
+
+    // Jammer status
+    if(d.us_jammer){
+      var j=d.us_jammer;
+      if(j.enabled){t('s-jammer','ACTIVE');cl(document.getElementById('s-jammer'),'v warn')}
+      else{t('s-jammer','STANDBY');cl(document.getElementById('s-jammer'),'v good')}
+      if(j.auto_mode){document.getElementById('btn-auto').className='active'}
+      else if(j.enabled){document.getElementById('btn-on').className='active'}
+      else{document.getElementById('btn-off').className='active'}
+    }
+
+    // Threats
+    buildThreats(sources);
+    buildFeed(sources);
+
+    // Bottom bar
+    t('b-time',new Date().toLocaleTimeString());
+    t('b-beat','Beats: '+beatPairs);
+    t('b-attacks','Attacks: '+attacks);
+    t('b-update','Updated: '+new Date().toLocaleTimeString());
+
+    // Refresh map
+    if(Date.now()-mapTs>MAP_INTERVAL)refreshMap();
+   })
+   .catch(function(e){
+    t('s-count','ERR');
+    console.error('API:',e);
+   });
+}
+
+// Init
+refreshMap();
+poll();
+document.getElementById('loader').classList.add('hide');
+setInterval(poll,INTERVAL);
+})();
+</script>
+</body>
+</html>
