@@ -231,8 +231,10 @@ def render_map(detections_data, width=3200, height=1800, zoom=15):
             required_mpp = max(required_mpp_lat, required_mpp_lon, 0.001)
             # Compute zoom: mpp = 156543 * cos(lat) / 2^z
             auto_zoom = int(math.log2(156543.0339 * math.cos(math.radians(observed_lat)) / required_mpp))
-            auto_zoom = max(0, min(17, int(zoom) if auto_zoom <= 0 else auto_zoom))  # cap at 17 — above that sat tiles are brown mush
-            zoom = auto_zoom
+            # Respect user zoom: user can zoom OUT further than auto (wider view),
+            # but auto-zoom can zoom IN for detail (use min of passed zoom and auto_zoom)
+            zoom = min(int(zoom), max(0, min(17, auto_zoom)))  # cap at 17
+            zoom = max(0, zoom)
 
     zoom = max(0, min(17, int(zoom)))  # cap at 17
 
