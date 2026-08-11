@@ -5061,36 +5061,32 @@ class MapHandler(BaseHTTPRequestHandler):
             return
 
         elif self.path.startswith('/map.png'):
-            global _MAP_PNG_CACHE, _MAP_CACHE_LOCK, _MAP_ZOOM_CACHE
+            import sys; print(f'[MAP DEBUG] handling {self.path}', file=sys.stderr, flush=True)
+            global _MAP_PNG_CACHE, _MAP_CACHE_LOCK
             # Parse zoom parameter: /map.png?z=14
             zoom = 14
-            custom_zoom = False
             if '?z=' in self.path:
                 try:
                     zoom = int(self.path.split('?z=')[1].split('&')[0])
                     zoom = max(8, min(22, zoom))
-                    custom_zoom = True
                 except:
                     pass
-            # Serve cached version only if zoom matches (or no custom zoom requested)
-            if not custom_zoom:
-                with _MAP_CACHE_LOCK:
-                    png = _MAP_PNG_CACHE
-                if png is not None:
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'image/png')
-                    self.send_header('Cache-Control', 'max-age=15')
-                    self.send_header('X-Content-Type-Options', 'nosniff')
-                    self.send_header('Content-Length', str(len(png)))
-                    self.end_headers()
-                    self.wfile.write(png)
-                    return
-            # Render fresh for custom zoom or empty cache
+            with _MAP_CACHE_LOCK:
+                png = _MAP_PNG_CACHE
+            if png is not None:
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png')
+                self.send_header('Cache-Control', 'max-age=15')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Content-Length', str(len(png)))
+                self.end_headers()
+                self.wfile.write(png)
+                return
+            # Render fresh if cache is empty
             try:
                 png_bytes = render_map(MapHandler.detections_data, zoom=zoom)
-                if not custom_zoom:
-                    with _MAP_CACHE_LOCK:
-                        _MAP_PNG_CACHE = png_bytes
+                with _MAP_CACHE_LOCK:
+                    _MAP_PNG_CACHE = png_bytes  # cache it
                 self.send_response(200)
                 self.send_header('Content-Type', 'image/png')
                 self.send_header('Cache-Control', 'max-age=15')
