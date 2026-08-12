@@ -1,224 +1,356 @@
-<!DOCTYPE html>
-<html lang="en">
+﻿<!DOCTYPE html>
+<html>
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>TSCM · QUAD RF v3</title>
-<link rel="stylesheet" href="./static/leaflet.css?tscm3">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TSCM â€” LIVE TRACKING</title>
+<link rel="stylesheet" href="/static/leaflet.css">
 <style>
-:root{--bg:#060608;--sf:#0c0c12;--bd:rgba(200,140,50,0.12);--tx:#c8b080;--mu:rgba(180,140,80,0.40);--ac:#d08828;--fn:'Courier New',monospace}
 *{margin:0;padding:0;box-sizing:border-box}
-html,body{width:100%;height:100%;background:var(--bg);color:var(--tx);font-family:var(--fn);overflow:hidden}
-#main{position:fixed;inset:4px 4px 22px 4px;display:grid;grid-template-columns:1fr 1fr;gap:4px;z-index:1}
-.panel{background:var(--sf);border:1px solid var(--bd);border-radius:2px;display:flex;flex-direction:column;overflow:hidden}
-.hdr{padding:4px 8px;border-bottom:1px solid var(--bd);font-size:9px;letter-spacing:0.06em;text-transform:uppercase;color:var(--mu);flex-shrink:0;background:rgba(200,140,50,0.03);display:flex;justify-content:space-between}
-.hdr .t{color:var(--ac);font-weight:600}
-.body{flex:1;position:relative;overflow:hidden}
-#cam-box{position:relative;width:100%;height:100%}
-#cam-img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
-#rf-cv{position:absolute;inset:0;width:100%;height:100%;z-index:10;pointer-events:none}
-.cam-c{position:absolute;inset:0;z-index:20;pointer-events:none}
-.cam-c::before,.cam-c::after{content:'';position:absolute;width:18px;height:18px;border-color:rgba(200,140,50,0.30);border-style:solid}
-.cam-c::before{top:3px;left:3px;border-width:1px 0 0 1px}
-.cam-c::after{bottom:3px;right:3px;border-width:0 1px 1px 0}
-#map{width:100%;height:100%;background:#1a1a2e}
-#bar{position:fixed;bottom:4px;left:4px;right:4px;z-index:100;display:flex;justify-content:space-between;align-items:center;padding:3px 8px;background:var(--sf);border:1px solid var(--bd);font-size:8px;color:var(--mu);gap:8px;font-family:var(--fn)}
-#bar span{white-space:nowrap}
-.dt{width:5px;height:5px;border-radius:50%;background:rgba(180,140,80,0.15);flex-shrink:0}
-.dt.ok{background:#289080}
-#ld{position:fixed;inset:0;z-index:10000;background:var(--bg);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;transition:opacity 0.3s}
-#ld.hide{opacity:0;pointer-events:none}
-#ld .sp{width:22px;height:22px;border:2px solid rgba(180,140,80,0.1);border-top-color:var(--ac);border-radius:50%;animation:rot 0.7s linear infinite}
-@keyframes rot{to{transform:rotate(360deg)}}
-#ld .msg{font-size:10px;color:var(--mu);letter-spacing:0.05em}
-#db{position:absolute;top:34px;left:4px;z-index:30;color:#fff;font:9px monospace;pointer-events:none;background:rgba(0,0,0,0.75);padding:2px 6px;max-width:90%}
+body{background:#000;overflow:hidden;font:12px 'Segoe UI',system-ui,sans-serif}
+#map{width:100vw;height:100vh;background:#0a0a0a}
+#status{position:fixed;top:8px;right:8px;z-index:1000;
+  background:rgba(0,0,0,0.75);color:#ddd;padding:8px 12px;
+  border-radius:6px;border:1px solid rgba(255,255,255,0.15);
+  font-size:11px;backdrop-filter:blur(4px);min-width:140px}
+#status .val{color:#e8943a;font-weight:700}
+#cam-box{width:220px;height:126px;margin:8px 0 0;background:#0c0c0c;border:1px solid rgba(150,150,150,0.3);border-radius:3px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
+#cam-box img{width:220px;height:126px;object-fit:cover;opacity:0.92}
+#cam-err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#ff6b81;font-size:10px;text-align:center;background:rgba(0,0,0,0.65)}
+#status .warn{color:#e8483a}
+#status .ok{color:#3ac8a0}
+#uspanel{position:fixed;bottom:8px;left:8px;z-index:1000;background:rgba(0,0,0,0.82);
+  border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:6px 8px;width:390px;
+  backdrop-filter:blur(4px);font-size:9px}
+#uspanel .us-head{color:#e8943a;font-size:9px;letter-spacing:1px;margin-bottom:3px;display:flex;justify-content:space-between}
+#uspanel canvas{width:100%;background:#020a08;border:1px solid rgba(255,255,255,0.08);border-radius:3px}
+#uspanel .us-label{color:#667;font-size:8px;margin:2px 0 4px;letter-spacing:1px}
+#uspanel .us-note{color:#557;font-size:8px;margin-top:2px}
+#side{position:fixed;top:8px;left:8px;bottom:8px;z-index:1000;
+  background:rgba(0,0,0,0.75);color:#ddd;padding:8px 10px;
+  border-radius:6px;border:1px solid rgba(255,255,255,0.15);
+  width:240px;overflow-y:auto;font-size:9px;backdrop-filter:blur(3px);max-height:70vh;
+  display:flex;flex-direction:column}
+#side h3{color:#e8943a;font-size:10px;letter-spacing:1px;margin:0 0 4px}
+.det-row{padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.06);
+  display:flex;justify-content:space-between;color:#aaa}
+.det-row .bear{color:#e8943a;font-size:9px}
+.leaflet-tooltip.det-tooltip{
+  background:rgba(0,0,0,0.9);color:#e8e8e8;border:1px solid #e8943a;
+  border-radius:6px;padding:8px 12px;font:11px 'Consolas',monospace;
+  box-shadow:0 2px 12px rgba(232,148,58,0.3);pointer-events:auto}
+.leaflet-tooltip.det-tooltip::before{border-top-color:#e8943a}
 </style>
 </head>
 <body>
-<div id="ld"><div class="sp"></div><div class="msg">QUAD RF · INITIALIZING</div></div>
-<div id="main">
-  <div class="panel">
-    <div class="hdr"><span class="t">▸ QUAD RF VISUALIZER</span><span><button id="heat-btn" onclick="window._heatOn=(window._heatOn===false?true:false);this.style.opacity=window._heatOn===false?0.4:1" style="background:none;border:1px solid rgba(200,140,50,0.3);color:var(--ac);font:8px monospace;padding:1px 6px;cursor:pointer;border-radius:2px;opacity:1">HEAT</button></span><span id="hc">--</span></div>
-    <div class="body"><div id="cam-box"><div id="db">WAIT</div><img id="cam-img" alt="RF Camera"><canvas id="rf-cv"></canvas><div class="cam-c"></div><div id="lg" style="position:absolute;top:6px;right:8px;z-index:25;font-size:7px;pointer-events:none;text-align:right;line-height:1.6"></div></div></div>
-  </div>
-  <div class="panel">
-    <div class="hdr"><span class="t">▸ SIGNAL MAP</span><span id="hm">--</span></div>
-    <div class="body"><div id="map"></div></div>
-  </div>
+<div id="map"></div>
+<div id="side"><div style="color:#e8943a;font-size:9px;margin-bottom:4px">BOOKMARK: http://localhost:8081/live</div>
+  <h3>â—† DETECTIONS <span id="side-count" style="color:#888">--</span></h3>
+  <div id="side-list" style="flex:1;overflow-y:auto"></div>
 </div>
-<div id="bar">
-  <span><span class="dt" id="da"></span>API</span>
-  <span><span class="dt" id="dc"></span>CAM</span>
-  <span id="bs">SRC --</span>
-  <span id="ba">AoA --</span>
-  <span id="bp">POS --</span>
-  <span id="bu">US --</span>
-  <span id="bm">C2 --</span>
-  <span id="bt">--</span>
+<div id="status">
+  <div>Sources: <span class="val" id="st-srcs">--</span></div>
+  <div>AoA: <span class="val" id="st-aoa">--</span>Â°</div>
+  <div>GPS: <span class="val" id="st-gps">--</span></div>
+  <div>Mapped: <span class="val" id="st-mapped">--</span></div>
+  <div style="margin-top:4px">BladeRF: <span class="val ok" id="st-brf">--</span></div>
+  <div>HackRF: <span class="val ok" id="st-hrf">--</span></div>
+  <div>RTL-SDR: <span class="val ok" id="st-rtl">--</span></div>
+  <div>Petterson: <span class="val ok" id="st-pet">--</span></div>
+    <div id="cam-box"><img id="cam-preview" alt="camera" src="/camera/snap?t=1" /><div id="cam-err">camera unavailable</div></div>
+    <div style="margin-top:6px;display:flex;gap:4px">
+      <button id="heat-btn" onclick="toggleHeat()" style="background:rgba(232,148,58,0.15);border:1px solid #e8943a;color:#e8943a;font:10px 'Segoe UI';padding:4px 10px;border-radius:4px;cursor:pointer;flex:1">HEAT: ON</button>
+    </div>
 </div>
-<script src="./static/leaflet.js?tscm3"></script>
+
+<div id="uspanel">
+  <div class="us-head"><span>ULTRASONIC SPECTRUM</span><span id="us-ts">--</span></div>
+  <canvas id="us-pet" width="760" height="110"></canvas>
+  <div class="us-label">PETT MSSON M500 - 0-192 kHz (full band)</div>
+  <canvas id="us-lap" width="760" height="80"></canvas>
+  <div class="us-label">LAPTOP SPATIAL ARRAY - 0-24 kHz</div>
+  <div class="us-note">pink dashes = detected modem / victim carriers</div>
+</div>
+<script src="/static/leaflet.js"></script>
 <script>
-(function(){'use strict';
-var API=window.location.origin, HOME=[41.513181,-88.133708], P=3000, CP=6000;
-var mm=null, mk={}, latest=null, rc, ctx, rw, rh, camBlob=null;
-function $(id){return document.getElementById(id)}
-function tx(id,t){var e=$(id);if(e)e.textContent=t}
-function dt(id,c){var e=$(id);if(e)e.className='dt '+(c||'')}
+var home = [41.51325, -88.13368];
+var map = L.map('map', {center:home, zoom:16, minZoom:0, maxZoom:21, zoomControl:true, attributionControl:false});
 
-// Camera
-function cam(){fetch(API+'/camera/snap?'+Date.now(),{signal:AbortSignal.timeout(8000)}).then(function(r){return r.blob()}).then(function(b){if(b&&b.size>1000){if(camBlob)URL.revokeObjectURL(camBlob);camBlob=URL.createObjectURL(b);$('cam-img').src=camBlob;tx('hc','LIVE');dt('dc','ok')}else{tx('hc','EMPTY')}}).catch(function(){tx('hc','DOWN')})}
+// Base layers — OSM default (shows streets/houses), satellite as toggles
+var osmLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom:19, attribution:'&copy; OpenStreetMap'
+});
+var satLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom:20, attribution:'Esri'
+});
+var googleSatLayer = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+  maxZoom:21, maxNativeZoom:20
+});
 
-// RF Canvas init with fallback sizing
-function rfI(){try{rc=$('rf-cv');if(!rc)return;ctx=rc.getContext('2d');function rs(){var b=$('cam-box'),img=$('cam-img');var ww=0,hh=0;if(b){var r=b.getBoundingClientRect();ww=r.width;hh=r.height}if(ww<10&&img&&img.naturalWidth){ww=img.naturalWidth;hh=img.naturalHeight}if(ww<10){ww=500;hh=375}rc.width=ww;rc.height=hh;rw=ww;rh=hh};rs();window.addEventListener('resize',rs);setTimeout(rs,300);setTimeout(rs,1000);setTimeout(rs,3000);setTimeout(rs,8000)}catch(e){console.error('rfI:',e)}}
+// Start with OpenStreetMap (houses + street names visible)
+satLayer.addTo(map);  // Default: satellite with house outlines
+var baseLayers = {'Streets (OSM)': osmLayer, 'Satellite (Esri)': satLayer, 'Satellite (Google)': googleSatLayer};
+L.control.layers(baseLayers, null, {position:'bottomright'}).addTo(map);
 
-function rfD(){
- if(!rw||!rh||rw<10){var b=$('cam-box'),img=$('cam-img');if(b){var r=b.getBoundingClientRect();rw=r.width;rh=r.height;rc.width=rw;rc.height=rh}if(rw<10&&img&&img.naturalWidth){rw=img.naturalWidth;rh=img.naturalHeight;rc.width=rw;rc.height=rh}if(rw<10){rw=500;rh=375;rc.width=rw;rc.height=rh}}
- if(!ctx||!rw||!rh||rw<10)return;
- var w=rw,h=rh,cx=w/2,cy=h/2,rad=Math.min(w,h)*0.44;
- ctx.clearRect(0,0,w,h);
-
- // Corner markers
- ctx.fillStyle='#ff4400';ctx.fillRect(0,0,30,30);
- ctx.fillStyle='#44ff00';ctx.fillRect(w-30,0,30,30);
- ctx.fillStyle='#4488ff';ctx.fillRect(0,h-30,30,30);
- ctx.fillStyle='#ffee00';ctx.fillRect(w-30,h-30,30,30);
-
- if(!latest||!latest.sources){ctx.fillStyle='#ff4400';ctx.font='bold 16px monospace';ctx.textAlign='center';ctx.fillText('WAITING FOR DATA',cx,cy);return}
-
- // Build bearing maps
- var posB={}, usB={}, allB={};
- if(latest.sources){latest.sources.forEach(function(s){
-  var br=s.bearing;if(!br||br===0)return;
-  var bk=Math.round(br);
-  // Positioned sources
-  if(s.lat&&s.lon){
-   var db=Math.round(Math.atan2(s.lon-HOME[1],s.lat-HOME[0])*180/Math.PI);
-   if(!posB[db]||(s.freq||0)>(posB[db].freq||0))posB[db]=s;
+var markerLayer = L.layerGroup().addTo(map);
+var rangeRings = L.layerGroup(); // hidden by default
+var aoaLine = null;
+var hullLine = null;
+var _heatOn = true;
+function toggleHeat(){
+  _heatOn = !_heatOn;
+  var btn = document.getElementById('heat-btn');
+  if(_heatOn){
+    markerLayer.addTo(map);
+    if(hullLine) hullLine.addTo(map);
+    if(aoaLine) aoaLine.addTo(map);
+    btn.textContent = 'HEAT: ON';
+    btn.style.opacity = '1';
+  } else {
+    map.removeLayer(markerLayer);
+    if(hullLine) map.removeLayer(hullLine);
+    if(aoaLine) map.removeLayer(aoaLine);
+    btn.textContent = 'HEAT: OFF';
+    btn.style.opacity = '0.5';
   }
-  // Ultrasound modem sources (c2, bpsk, fsk, silent_sound)
-  if(s.detector&&(s.detector.indexOf('us_bpsk')>=0||s.detector.indexOf('us_modem')>=0||s.detector.indexOf('c2_c2')>=0||s.detector.indexOf('silent_sound')>=0||s.detector.indexOf('voice_to')>=0)){
-   if(!usB[bk]||(s.freq||0)>(usB[bk].freq||0))usB[bk]=s;
-  }
-  // All other bearing sources (aggregate)
-  if(!allB[bk])allB[bk]={count:0,tx:0,vic:0,freqs:[]};
-  allB[bk].count++;
-  if(s.classification==='transmitter')allB[bk].tx++;
-  else if(s.classification==='victim')allB[bk].vic++;
-  if(s.freq>0)allB[bk].freqs.push(s.freq);
- })}
-
- // Ring
- ctx.strokeStyle='rgba(200,140,50,0.15)';ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(cx,cy,rad,0,Math.PI*2);ctx.stroke();
- ctx.strokeStyle='rgba(200,140,50,0.08)';ctx.lineWidth=0.5;ctx.beginPath();ctx.arc(cx,cy,rad*0.55,0,Math.PI*2);ctx.stroke();
-
- // Ticks + cardinals
- for(var i=0;i<360;i+=15){
-  var a=i*Math.PI/180, isMaj=i%30===0;
-  ctx.strokeStyle=isMaj?'rgba(200,140,50,0.25)':'rgba(200,140,50,0.10)';
-  ctx.lineWidth=isMaj?1:0.5;
-  ctx.beginPath();ctx.moveTo(cx+Math.sin(a)*rad*0.9,cy-Math.cos(a)*rad*0.9);ctx.lineTo(cx+Math.sin(a)*rad,cy-Math.cos(a)*rad);ctx.stroke();
-  if(isMaj){
-   ctx.fillStyle='rgba(200,140,80,0.45)';ctx.font='bold 10px monospace';ctx.textAlign='center';
-   var dirs={0:'N',90:'E',180:'S',270:'W'};var d=dirs[i]||'';
-   ctx.fillText(d,cx+Math.sin(a)*(rad+13),cy-Math.cos(a)*(rad+13)+4);
-  }
- }
-
- // === DRAW AGGREGATE BEARING HEAT (gray density lines) ===
- if(window._heatOn!==false){
- Object.keys(allB).forEach(function(k){
-  var b=parseFloat(k),info=allB[k],ra=b*Math.PI/180;
-  var alpha=Math.min(0.4,info.count*0.03);
-  ctx.strokeStyle='rgba(200,200,200,'+alpha.toFixed(2)+')';
-  ctx.lineWidth=Math.min(6,1+info.count*0.3);
-  ctx.beginPath();ctx.moveTo(cx+Math.sin(ra)*rad*0.5,cy-Math.cos(ra)*rad*0.5);
-  ctx.lineTo(cx+Math.sin(ra)*rad,cy-Math.cos(ra)*rad);ctx.stroke();
- });
- }
-
- // === US MODEM BEARINGS (GREEN/BLUE — the real C2 direction) ===
- Object.keys(usB).forEach(function(k){
-  var s=usB[k],b=parseFloat(k),ra=b*Math.PI/180;
-  // Solid green line for US modem
-  ctx.strokeStyle='rgba(0,255,180,0.7)';ctx.lineWidth=3;
-  ctx.setLineDash([]);
-  ctx.beginPath();ctx.moveTo(cx+Math.sin(ra)*rad*0.55,cy-Math.cos(ra)*rad*0.55);
-  ctx.lineTo(cx+Math.sin(ra)*rad,cy-Math.cos(ra)*rad);ctx.stroke();
-  // Big green dot
-  var sx=cx+Math.sin(ra)*(rad-6),sy=cy-Math.cos(ra)*(rad-6);
-  ctx.fillStyle='rgba(0,255,180,0.85)';ctx.beginPath();ctx.arc(sx,sy,8,0,Math.PI*2);ctx.fill();
-  ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
-  // Label
-  ctx.fillStyle='#00ffb4';ctx.font='bold 10px monospace';ctx.textAlign='center';
-  var fn=s.detector?s.detector.replace(/_/g,' ').substring(0,18):(s.freq/1000).toFixed(0)+'kHz';
-  ctx.fillText(fn+' '+b+'°',cx+Math.sin(ra)*(rad+24),cy-Math.cos(ra)*(rad+24)+3);
- });
-
- // === POSITIONED SOURCES (GOLD/RED) ===
- Object.keys(posB).forEach(function(k){
-  var s=posB[k],b=parseFloat(k),ra=b*Math.PI/180;
-  var isTX=s.classification==='transmitter',col=isTX?'rgba(255,200,80,0.95)':'rgba(255,130,130,0.8)';
-  ctx.strokeStyle=isTX?'rgba(255,200,80,0.35)':'rgba(255,130,130,0.20)';ctx.lineWidth=isTX?2:1;
-  ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.sin(ra)*rad,cy-Math.cos(ra)*rad);ctx.stroke();
-  var sx=cx+Math.sin(ra)*(rad-12),sy=cy-Math.cos(ra)*(rad-12);
-  ctx.fillStyle=col;ctx.beginPath();ctx.arc(sx,sy,isTX?6:4,0,Math.PI*2);ctx.fill();
-  ctx.fillStyle=col;ctx.font='bold 8px monospace';ctx.textAlign='center';
-  var fl=s.freq>=1e9?(s.freq/1e9).toFixed(1)+'G':s.freq>=1e6?(s.freq/1e6).toFixed(0)+'M':(s.freq/1000).toFixed(0)+'k';
-  ctx.fillText(fl+' '+b+'°',cx+Math.sin(ra)*(rad+20),cy-Math.cos(ra)*(rad+20)+3);
- });
-
- // AoA line
- var aoa=latest.observer?latest.observer.aoa:null;
- if(aoa!=null){
-  var aa=aoa*Math.PI/180;
-  ctx.strokeStyle='rgba(208,136,40,0.5)';ctx.lineWidth=2;ctx.setLineDash([8,6]);ctx.beginPath();
-  ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.sin(aa)*rad,cy-Math.cos(aa)*rad);ctx.stroke();ctx.setLineDash([]);
-  var adx=cx+Math.sin(aa)*rad*0.8,ady=cy-Math.cos(aa)*rad*0.8;
-  ctx.fillStyle='rgba(208,136,40,0.5)';ctx.beginPath();ctx.arc(adx,ady,8,0,Math.PI*2);ctx.fill();
-  ctx.fillStyle='#ffc040';ctx.beginPath();ctx.arc(adx,ady,4,0,Math.PI*2);ctx.fill();
-  ctx.fillStyle='#ffc040';ctx.font='bold 9px monospace';ctx.textAlign='center';
-  ctx.fillText('AoA '+aoa.toFixed(0),cx+Math.sin(aa)*(rad+24),cy-Math.cos(aa)*(rad+24)+3);
- }
-
- // Crosshair
- ctx.strokeStyle='rgba(200,140,50,0.5)';ctx.lineWidth=1;
- ctx.beginPath();ctx.moveTo(cx-14,cy);ctx.lineTo(cx+14,cy);ctx.stroke();
- ctx.beginPath();ctx.moveTo(cx,cy-14);ctx.lineTo(cx,cy+14);ctx.stroke();
-
- // Legend
- var ptx=0,pvic=0;Object.keys(posB).forEach(function(k){var c=posB[k].classification;if(c==='transmitter')ptx++;else if(c==='victim')pvic++});
- $('lg').innerHTML=
-  '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(255,200,80,0.9);vertical-align:middle;margin-right:4px"></span>TX '+ptx+'</div>'+
-  '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(255,130,130,0.8);vertical-align:middle;margin-right:4px"></span>V '+pvic+'</div>'+
-  '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#00ffb4;vertical-align:middle;margin-right:4px"></span>C2 MODEM '+(Object.keys(usB).length||0)+'</div>';
-
- // Debug
- var db='CANVAS '+w+'x'+h+' | RF rendered';
- if(latest){db+=' | SRC='+(latest.sources||[]).length;if(latest.observer)db+=' AoA='+(latest.observer.aoa||0).toFixed(0)+'°'}
- tx('db',db);
 }
 
-// Map
-function mapI(){var dbg=$('db');try{dbg.textContent='MAP:init...';mm=L.map('map',{center:HOME,zoom:15,zoomControl:true,attributionControl:false,scrollWheelZoom:true});dbg.textContent='MAP:layers...';L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,errorTileUrl:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='}).addTo(mm);L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:18}).addTo(mm);L.circleMarker(HOME,{radius:6,fillColor:'#d08828',color:'#d08828',weight:1.5,opacity:0.9,fillOpacity:0.9}).addTo(mm).bindTooltip('OBSERVER');dbg.textContent='MAP:OK v'+L.version;setTimeout(function(){if(mm){mm.invalidateSize();dbg.textContent+=' size:'+$('map').offsetWidth+'x'+$('map').offsetHeight}},500);window.addEventListener('resize',function(){if(mm)mm.invalidateSize()})}catch(e){console.error('Map init:',e);$('db').textContent='MAP:ERR '+e.message}}
-function mapU(d){if(!mm||!d||!d.sources)return;var ak={},p=0;d.sources.forEach(function(s){if(!s.lat||!s.lon)return;p++;var k=s.lat.toFixed(6)+','+s.lon.toFixed(6);ak[k]=true;if(mk[k]){mk[k].setLatLng([s.lat,s.lon])}else{var col=s.classification==='transmitter'?'#d4a860':s.classification==='victim'?'#d47373':'#888';mk[k]=L.circleMarker([s.lat,s.lon],{radius:s.classification==='transmitter'?8:5,fillColor:col,color:col,weight:1,opacity:0.85,fillOpacity:0.45}).addTo(mm).bindTooltip((s.detector||'').replace(/_/g,' ').substring(0,20))}});for(var k in mk){if(!ak[k]){mm.removeLayer(mk[k]);delete mk[k]}};tx('hm',p+' PINNED')}
+L.circleMarker(home, {radius:8, fillColor:'#3ac8a0', color:'#fff', weight:3, fillOpacity:0.9})
+  .addTo(map).bindTooltip('YOU (HOME)', {permanent:true, direction:'right', className:'det-tooltip', offset:[10,0]});
 
-// Poll
-function poll(){fetch(API+'/api/detections',{signal:AbortSignal.timeout(5000)}).then(function(r){if(!r.ok)throw new Error(r.status);return r.json()}).then(function(d){latest=d;dt('da','ok');
- var n=(d.sources||[]).length, pos=0, us=0, c2=0;
- if(d.sources){d.sources.forEach(function(s){
-  if(s.lat&&s.lon)pos++;
-  if(s.freq>=18000&&s.freq<=48000)us++;
-  if(s.detector&&(s.detector.indexOf('us_bpsk')>=0||s.detector.indexOf('us_modem')>=0||s.detector.indexOf('c2_c2')>=0))c2++;
- })}
- tx('bs','SRC '+n);tx('bp','POS '+pos);tx('bu','US '+us);tx('bm','C2 '+c2);
- if(d.observer&&d.observer.aoa!=null)tx('ba','AoA '+d.observer.aoa.toFixed(0)+'°');
- mapU(d);rfD();tx('bt',new Date().toLocaleTimeString())}).catch(function(e){dt('da',null);tx('db','API: '+e.message)})}
+[100,300,1000,3000,8000].forEach(function(r){
+  L.circle(home, {radius:r, color:'rgba(180,190,200,0.4)', weight:1, fill:false}).addTo(rangeRings);
+});
 
-function init(){try{rfI()}catch(e){};try{mapI()}catch(e){console.error('mapI:',e)};cam();poll();$('ld').classList.add('hide');setInterval(poll,P);setInterval(cam,CP)}
-window.addEventListener('load',init);
-// Aggressive overlay removal (backup in case init fails)
-setTimeout(function(){$('ld').classList.add('hide')},2000);
-setTimeout(function(){$('ld').classList.add('hide')},5000);
+function escH(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function getColor(det, cls) {
+  var dl = (det||'').toLowerCase(), cl = (cls||'').toLowerCase();
+  if(dl.indexOf('c2')>=0||cl.indexOf('attack')>=0) return '#e8483a';
+  if(dl.indexOf('mw_voice')>=0||dl.indexOf('carbon')>=0) return '#e848b0';
+  if(dl.indexOf('silent')>=0) return '#e8943a';
+  if(dl.indexOf('eeg')>=0) return '#e8e03a';
+  if(dl.indexOf('ultrasound')>=0) return '#c03ae8';
+  if(dl.indexOf('stingray')>=0) return '#ff0000';
+  return '#e8943a';
+}
+
+function convexHull(points) {
+  if(points.length<3) return points;
+  points = points.sort(function(a,b){return a[0]-b[0]||a[1]-b[1]});
+  var cross=function(o,a,b){return (a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0])};
+  var lo=[],up=[],i;
+  for(i=0;i<points.length;i++){while(lo.length>=2&&cross(lo[lo.length-2],lo[lo.length-1],points[i])<=0)lo.pop();lo.push(points[i]);}
+  for(i=points.length-1;i>=0;i--){while(up.length>=2&&cross(up[up.length-2],up[up.length-1],points[i])<=0)up.pop();up.push(points[i]);}
+  return lo.slice(0,-1).concat(up.slice(0,-1));
+}
+function fetchAddr(lat,lon,el){
+  el.textContent='looking up...';
+  fetch('https://nominatim.openstreetmap.org/reverse?format=json&lat='+lat+'&lon='+lon+'&zoom=18&addressdetails=1')
+    .then(function(r){return r.json()})
+    .then(function(d){el.textContent=d.display_name||(lat.toFixed(5)+','+lon.toFixed(5));el.style.color='#e8943a'})
+    .catch(function(){el.textContent=lat.toFixed(5)+','+lon.toFixed(5)});
+}
+
+function update() {
+  fetch('/api/detections').then(function(r){return r.json()}).then(function(d){
+    var sources = d.sources || [];
+    var obs = d.observer || {};
+    
+    document.getElementById('st-srcs').textContent = sources.length;
+    document.getElementById('st-aoa').textContent = (obs.aoa||0).toFixed(1);
+    var gps = document.getElementById('st-gps');
+    gps.textContent = obs.gps_fix ? 'FIX' : 'NO FIX';
+    gps.className = obs.gps_fix ? 'val ok' : 'val warn';
+
+    // Sort by threat priority
+    var threat = {c2:0,attack:1,mw_voice:2,carbon:3,silent:4,eeg:5,ultrasound:6,stingray:0};
+    sources.sort(function(a,b){
+      var da=(a.detector||'').toLowerCase(),db=(b.detector||'').toLowerCase();
+      var pa=99,pb=99;
+      for(var k in threat){if(da.indexOf(k)>=0)pa=Math.min(pa,threat[k]);if(db.indexOf(k)>=0)pb=Math.min(pb,threat[k]);}
+      if(pa!==pb) return pa-pb;
+      return (b.observations||0)-(a.observations||0);
+    });
+
+    // Sidebar list â€” show ALL sources (with and without coordinates)
+    var sideHTML = '';
+    var mappedCount = 0;
+    sources.forEach(function(s,i){
+      var hasCoord = s.lat && s.lon && Math.abs(s.lat)>0.001;
+      if(hasCoord) mappedCount++;
+      var color = getColor(s.detector||'', s.classification||'');
+      var name = (s.detector||'unknown').substring(0,18);
+      var freq = s.freq||0;
+      var fs = freq>1e6?(freq/1e6).toFixed(1)+'M':(freq>1e3?(freq/1e3).toFixed(1)+'k':freq.toFixed(0));
+      var bear = s.bearing ? Math.round(s.bearing)+'\u00B0' : '';
+      var icon = hasCoord ? '\u25CF' : '\u25D8';
+      sideHTML += '<div class="det-row">'+
+        '<span><span style="color:'+color+'">'+icon+'</span> '+escH(name)+'</span>'+
+        '<span class="bear">'+bear+(bear?' ':'')+fs+'</span></div>';
+    });
+    document.getElementById('side-list').innerHTML = sideHTML || '<div style="color:#666;padding:10px">NO DETECTIONS</div>';
+    document.getElementById('side-count').textContent = sources.length + ' total';
+    document.getElementById('st-mapped').textContent = mappedCount + ' mapped';
+    // Equipment status
+    var obs = d.observer || {};
+    document.getElementById('st-brf').textContent = obs.bladerf ? 'ON' : 'OFF';
+    document.getElementById('st-brf').className = obs.bladerf ? 'val ok' : 'val warn';
+    document.getElementById('st-hrf').textContent = obs.hackrf ? 'ON' : 'OFF';
+    document.getElementById('st-hrf').className = obs.hackrf ? 'val ok' : 'val warn';
+    var rtl = obs.rtlsdr || false;
+    document.getElementById('st-rtl').textContent = rtl ? 'ON' : 'OFF';
+    document.getElementById('st-rtl').className = rtl ? 'val ok' : 'val warn';
+    var petRate = obs.pet_rate || 0;
+    document.getElementById('st-pet').textContent = (petRate/1000).toFixed(0) + 'kHz';
+    document.getElementById('st-pet').className = petRate >= 100000 ? 'val ok' : 'val warn';
+
+    // === ULTRASONIC SPECTRUM PANEL ===
+    var us = d.us_spectrum || {};
+    if(us.ts) document.getElementById('us-ts').textContent = new Date(us.ts*1000).toLocaleTimeString();
+    var usMarkers = [];
+    sources.forEach(function(s){
+      var f = s.freq||0;
+      if(f>15000 && f<200000 && (s.classification||'').length) usMarkers.push({f:f});
+    });
+    drawSpec(document.getElementById('us-pet'), us.petterson, 'pet', usMarkers, 192000);
+    drawSpec(document.getElementById('us-lap'), us.laptop, 'lap', null, 24000);
+
+    // Map markers â€” ALL sources get bearing lines + coordinate markers if available
+    // Skip map-layer rebuild when data is unchanged (prevents 4s flicker)
+    var sig = JSON.stringify(sources.map(function(s){
+      return [s.freq||0, Math.round((s.snr||0)*10)/10, s.bearing||null, s.lat||null, s.lon||null, s.classification||''];
+    }));
+    if (sig === window._lastSig) { return; }
+    window._lastSig = sig;
+    markerLayer.clearLayers();
+    if(hullLine) { map.removeLayer(hullLine); hullLine = null; }
+    if(aoaLine) { map.removeLayer(aoaLine); aoaLine = null; }
+
+    var positions = [[home[0], home[1]]];
+    var bearingLines = [];
+    sources.forEach(function(s){
+      var color = getColor(s.detector||'', s.classification||'');
+      var freq = s.freq||0;
+      var fs = freq>1e9?(freq/1e9).toFixed(2)+'G':(freq>1e6?(freq/1e6).toFixed(1)+'M':(freq>1e3?(freq/1e3).toFixed(1)+'k':freq.toFixed(0)+'Hz'));
+      var bear = s.bearing;
+      var hasBear = bear != null && Math.abs(bear) > 0.5;
+      var hasCoord = s.lat && s.lon && Math.abs(s.lat) > 0.001;
+      
+      // Bearing lines from home for ALL sources with bearing (even without coords)
+      if (hasBear) {
+        var rad = bear * Math.PI / 180;
+        var lineLen = s.range ? s.range : 5000;  // use range if available, else 5km default
+        var endLat = home[0] + Math.cos(rad) * lineLen / 111320;
+        var endLon = home[1] + Math.sin(rad) * lineLen / (111320 * Math.cos(home[0] * Math.PI/180));
+        var line = L.polyline([home, [endLat, endLon]], {
+          color: color, weight: 2.5, opacity: 0.85, dashArray: '8,3'
+        });
+        bearingLines.push(line);
+        
+        // Endpoint marker on bearing line
+        var epR = 7;
+        L.circleMarker([endLat, endLon], {
+          radius: epR, color: color, fillColor: color, fillOpacity: 0.8, weight: 1
+        }).addTo(markerLayer);
+      }
+      
+      // Coordinate markers for sources with positions
+      if (hasCoord) {
+        positions.push([s.lat, s.lon]);
+        var m = L.circleMarker([s.lat, s.lon], {
+          radius: s.triangulated?10:7, color: '#fff', weight: 3, fillColor: color, fillOpacity: 0.9
+        }).addTo(markerLayer);
+        
+        var html = '<b style="color:'+color+'">'+escH(s.detector||'unknown')+'</b><br>'+
+          'Freq: '+fs+' | '+escH(s.classification||'--')+'<br>'+
+          'Bearing: '+(hasBear?Math.round(bear)+'\u00B0':'--')+'<br>'+
+          (s.triangulated?'<b style="color:#3ac8a0">TRIANGULATED</b> ':'')+
+          'Obs: '+(s.observations||1);
+        m.bindTooltip(html, {direction:'top', className:'det-tooltip', offset:[0,-8]});
+      }
+    });
+    
+    // Add all bearing lines at once
+    bearingLines.forEach(function(bl){ bl.addTo(markerLayer); });
+
+    // Convex hull
+    var hull = convexHull(positions);
+    if(hull.length >= 3) {
+      hull.push(hull[0]);
+      hullLine = L.polyline(hull, {
+        color:'#e8943a', weight:2, opacity:0.7, dashArray:'8,4'
+      }).addTo(map);
+      hull.slice(0,-1).forEach(function(p){
+        L.circleMarker(p, {radius:4, color:'#c85000', fillColor:'#c85000', fillOpacity:0.8, weight:2})
+          .addTo(markerLayer).bindTooltip('ENDPOINT', {className:'det-tooltip'});
+      });
+      // Auto-zoom disabled: user controls map view. Hull is drawn regardless.
+    }
+
+    // AoA
+    var aoa = obs.aoa || 0;
+    if(Math.abs(aoa) > 0.5) {
+      var rad = aoa * Math.PI/180;
+      var endLat = home[0] + Math.cos(rad)*0.1;
+      var endLon = home[1] + Math.sin(rad)*0.1/Math.cos(home[0]*Math.PI/180);
+      aoaLine = L.polyline([home, [endLat, endLon]], {
+        color:'#ff2828', weight:3, opacity:0.8
+      }).addTo(map).bindTooltip('AoA '+aoa.toFixed(0)+'\u00B0', {permanent:true, className:'det-tooltip'});
+    }
+  }).catch(function(){});
+}
+
+var usHist = {pet: [], lap: []};
+function drawSpec(canvas, spec, histKey, markers, maxF){
+  if(!spec || !spec.power) return;
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  var p = spec.power, n = p.length;
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = '#020a08'; ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle = 'rgba(58,200,160,0.22)'; ctx.lineWidth = 1;
+  for(var g=0; g<=4; g++){ var gy = H - (H*g/4); ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke(); }
+  var maxV = 8;
+  p.forEach(function(v){ if(v>maxV) maxV=v; });
+  maxV = Math.max(maxV, 3);
+  var hist = usHist[histKey] || []; hist.push(p.slice()); if(hist.length>40) hist.shift(); usHist[histKey]=hist;
+  hist.forEach(function(pp, hi){
+    var alpha = 0.05 + 0.6 * (hi/hist.length);
+    ctx.strokeStyle = 'rgba(232,148,58,'+alpha.toFixed(3)+')';
+    ctx.beginPath();
+    for(var i=0;i<pp.length;i++){ var x=(i/(n-1))*W; var y=H-Math.min(pp[i],maxV)/maxV*H; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
+  });
+  if(markers){
+    markers.forEach(function(mk){
+      var x = (mk.f/maxF)*W;
+      if(x<0||x>W) return;
+      ctx.strokeStyle = 'rgba(232,72,176,0.9)'; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#e848b0'; ctx.font = '8px Consolas';
+      ctx.fillText((mk.f/1000).toFixed(0)+'k', x+2, 8);
+    });
+  }
+}
+
+update();
+setInterval(update, 4000);
+// Live camera: refresh every 3s, retry on error (box is fixed-size, never flashes)
+var _camFails=0;
+(function(){
+  var im=document.getElementById('cam-preview'), er=document.getElementById('cam-err');
+  if(!im) return;
+  im.onerror=function(){ _camFails++; if(er){er.style.display='flex';} };
+  im.onload=function(){ _camFails=0; if(er){er.style.display='none';} };
+  setInterval(function(){ im.src='/camera/snap?t='+Date.now(); }, 3000);
 })();
+
+document.addEventListener('keydown',function(e){
+  if(e.key==='r') update();
+  if(e.key==='f') { try{var b=map.getBounds();map.fitBounds(b);}catch(e){} }
+  if(e.key==='h') map.setView(home, 15);
+});
 </script>
 </body>
 </html>
