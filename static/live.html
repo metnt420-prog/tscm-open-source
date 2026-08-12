@@ -37,7 +37,7 @@ html,body{width:100%;height:100%;background:var(--bg);color:var(--tx);font-famil
 <div id="ld"><div class="sp"></div><div class="msg">QUAD RF · INITIALIZING</div></div>
 <div id="main">
   <div class="panel">
-    <div class="hdr"><span class="t">▸ QUAD RF VISUALIZER</span><span id="hc">--</span></div>
+    <div class="hdr"><span class="t">▸ QUAD RF VISUALIZER</span><span><button id="heat-btn" onclick="window._heatOn=(window._heatOn===false?true:false);this.style.opacity=window._heatOn===false?0.4:1" style="background:none;border:1px solid rgba(200,140,50,0.3);color:var(--ac);font:8px monospace;padding:1px 6px;cursor:pointer;border-radius:2px;opacity:1">HEAT</button></span><span id="hc">--</span></div>
     <div class="body"><div id="cam-box"><div id="db">WAIT</div><img id="cam-img" alt="RF Camera"><canvas id="rf-cv"></canvas><div class="cam-c"></div><div id="lg" style="position:absolute;top:6px;right:8px;z-index:25;font-size:7px;pointer-events:none;text-align:right;line-height:1.6"></div></div></div>
   </div>
   <div class="panel">
@@ -123,8 +123,8 @@ function rfD(){
   }
  }
 
- // === AGGREGATE LINES DISABLED for clean map view ===
- /*
+ // === DRAW AGGREGATE BEARING HEAT (gray density lines) ===
+ if(window._heatOn!==false){
  Object.keys(allB).forEach(function(k){
   var b=parseFloat(k),info=allB[k],ra=b*Math.PI/180;
   var alpha=Math.min(0.4,info.count*0.03);
@@ -133,7 +133,7 @@ function rfD(){
   ctx.beginPath();ctx.moveTo(cx+Math.sin(ra)*rad*0.5,cy-Math.cos(ra)*rad*0.5);
   ctx.lineTo(cx+Math.sin(ra)*rad,cy-Math.cos(ra)*rad);ctx.stroke();
  });
- */
+ }
 
  // === US MODEM BEARINGS (GREEN/BLUE — the real C2 direction) ===
  Object.keys(usB).forEach(function(k){
@@ -198,8 +198,8 @@ function rfD(){
 }
 
 // Map
-function mapI(){var dbg=$('db');try{dbg.textContent='MAP:init...';mm=L.map('map',{center:HOME,zoom:15,zoomControl:false,attributionControl:false});dbg.textContent='MAP:layers...';L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,errorTileUrl:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='}).addTo(mm);L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:18}).addTo(mm);L.circleMarker(HOME,{radius:6,fillColor:'#d08828',color:'#d08828',weight:1.5,opacity:0.9,fillOpacity:0.9}).addTo(mm).bindTooltip('OBSERVER');dbg.textContent='MAP:OK v'+L.version;setTimeout(function(){if(mm){mm.invalidateSize();dbg.textContent+=' size:'+$('map').offsetWidth+'x'+$('map').offsetHeight}},500);window.addEventListener('resize',function(){if(mm)mm.invalidateSize()})}catch(e){console.error('Map init:',e);$('db').textContent='MAP:ERR '+e.message}}
-function mapU(d){if(!mm||!d||!d.sources)return;var ak={},p=0;d.sources.forEach(function(s){if(!s.lat||!s.lon)return;p++;var k=s.lat.toFixed(6)+','+s.lon.toFixed(6);ak[k]=true;if(mk[k]){mk[k].setLatLng([s.lat,s.lon])}else{var col=s.classification==='transmitter'?'#d4a860':s.classification==='victim'?'#d47373':'#888';mk[k]=L.circleMarker([s.lat,s.lon],{radius:s.classification==='transmitter'?6:4,fillColor:col,color:col,weight:1,opacity:0.4,fillOpacity:0.15}).addTo(mm).bindTooltip((s.detector||'').replace(/_/g,' ').substring(0,20))}});for(var k in mk){if(!ak[k]){mm.removeLayer(mk[k]);delete mk[k]}};tx('hm',p+' PINNED')}
+function mapI(){var dbg=$('db');try{dbg.textContent='MAP:init...';mm=L.map('map',{center:HOME,zoom:15,zoomControl:true,attributionControl:false,scrollWheelZoom:true});dbg.textContent='MAP:layers...';L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,errorTileUrl:'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='}).addTo(mm);L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:18}).addTo(mm);L.circleMarker(HOME,{radius:6,fillColor:'#d08828',color:'#d08828',weight:1.5,opacity:0.9,fillOpacity:0.9}).addTo(mm).bindTooltip('OBSERVER');dbg.textContent='MAP:OK v'+L.version;setTimeout(function(){if(mm){mm.invalidateSize();dbg.textContent+=' size:'+$('map').offsetWidth+'x'+$('map').offsetHeight}},500);window.addEventListener('resize',function(){if(mm)mm.invalidateSize()})}catch(e){console.error('Map init:',e);$('db').textContent='MAP:ERR '+e.message}}
+function mapU(d){if(!mm||!d||!d.sources)return;var ak={},p=0;d.sources.forEach(function(s){if(!s.lat||!s.lon)return;p++;var k=s.lat.toFixed(6)+','+s.lon.toFixed(6);ak[k]=true;if(mk[k]){mk[k].setLatLng([s.lat,s.lon])}else{var col=s.classification==='transmitter'?'#d4a860':s.classification==='victim'?'#d47373':'#888';mk[k]=L.circleMarker([s.lat,s.lon],{radius:s.classification==='transmitter'?8:5,fillColor:col,color:col,weight:1,opacity:0.85,fillOpacity:0.45}).addTo(mm).bindTooltip((s.detector||'').replace(/_/g,' ').substring(0,20))}});for(var k in mk){if(!ak[k]){mm.removeLayer(mk[k]);delete mk[k]}};tx('hm',p+' PINNED')}
 
 // Poll
 function poll(){fetch(API+'/api/detections',{signal:AbortSignal.timeout(5000)}).then(function(r){if(!r.ok)throw new Error(r.status);return r.json()}).then(function(d){latest=d;dt('da','ok');
