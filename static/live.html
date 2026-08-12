@@ -60,7 +60,9 @@ body{background:#000;overflow:hidden;font:12px 'Segoe UI',system-ui,sans-serif}
     <div id="cam-box"><img id="cam-preview" alt="camera" src="/camera/snap?t=1" /><div id="cam-err">camera unavailable</div></div>
     <div style="margin-top:6px;display:flex;gap:4px">
       <button id="heat-btn" onclick="toggleHeat()" style="background:rgba(232,148,58,0.15);border:1px solid #e8943a;color:#e8943a;font:10px 'Segoe UI';padding:4px 10px;border-radius:4px;cursor:pointer;flex:1">HEAT: ON</button>
+      <button id="cam-mode-btn" onclick="toggleCamMode()" style="background:rgba(58,200,160,0.15);border:1px solid #3ac8a0;color:#3ac8a0;font:10px 'Segoe UI';padding:4px 10px;border-radius:4px;cursor:pointer;flex:1">CAM: RAW</button>
     </div>
+    <div style="margin-top:4px;font-size:8px;color:#667">BURST <span class="val" id="st-burst" style="color:#e8943a">--</span></div>
 </div>
 
 <div id="uspanel">
@@ -232,6 +234,15 @@ function update() {
     var petRate = obs.pet_rate || 0;
     document.getElementById('st-pet').textContent = (petRate/1000).toFixed(0) + 'kHz';
     document.getElementById('st-pet').className = petRate >= 100000 ? 'val ok' : 'val warn';
+    // RF burst counter from API rf_bursts data
+    var rb = d.rf_bursts || {};
+    var burstEl = document.getElementById('st-burst');
+    if(burstEl){
+      var total = rb.total_bursts || 0;
+      var recent = rb.recent_bursts || 0;
+      burstEl.textContent = recent + '/' + total;
+      burstEl.style.color = recent > 0 ? '#ff4040' : '#e8943a';
+    }
 
     // === ULTRASONIC SPECTRUM PANEL ===
     var us = d.us_spectrum || {};
@@ -369,13 +380,23 @@ function drawSpec(canvas, spec, histKey, markers, maxF){
 update();
 setInterval(update, 4000);
 // Live camera: refresh every 3s, retry on error (box is fixed-size, never flashes)
+// CAM mode toggle: RAW (/camera/snap) vs RF overlay (/camera/rf)
+var _camMode = 'raw';
+function toggleCamMode(){
+  _camMode = (_camMode === 'raw') ? 'rf' : 'raw';
+  var btn = document.getElementById('cam-mode-btn');
+  if(btn){ btn.textContent = 'CAM: ' + (_camMode === 'rf' ? 'RF' : 'RAW'); }
+  // refresh immediately
+  var im = document.getElementById('cam-preview');
+  if(im) im.src = (_camMode === 'rf' ? '/camera/rf' : '/camera/snap') + '?t=' + Date.now();
+}
 var _camFails=0;
 (function(){
   var im=document.getElementById('cam-preview'), er=document.getElementById('cam-err');
   if(!im) return;
   im.onerror=function(){ _camFails++; if(er){er.style.display='flex';} };
   im.onload=function(){ _camFails=0; if(er){er.style.display='none';} };
-  setInterval(function(){ im.src='/camera/snap?t='+Date.now(); }, 3000);
+  setInterval(function(){ im.src=(_camMode === 'rf' ? '/camera/rf' : '/camera/snap') + '?t=' + Date.now(); }, 3000);
 })();
 
 document.addEventListener('keydown',function(e){

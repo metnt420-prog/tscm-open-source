@@ -12960,6 +12960,14 @@ class TSCMSystem:
             if hack:
                 iq_hack=hack['data']
                 h_rf_freq = hack.get('frequency', Config.HACKRF_FREQ_TARGET)
+                # Save HackRF spectrum for waterfall logger (every 5 cycles)
+                if self.cycle_count % 5 == 0 and len(iq_hack) >= 4096:
+                    try:
+                        _wf_fft = np.abs(np.fft.rfft(np.asarray(iq_hack[-4096:], dtype=np.complex128)))
+                        _wf_f = np.fft.rfftfreq(4096, 1/Config.HACKRF_SAMPLE_RATE)
+                        self._last_hackrf_spectrum = (_wf_f, 20*np.log10(_wf_fft + 1e-12))
+                    except Exception:
+                        pass
             #
             # Persist last AoA for ALL cycles (BladeRF may not capture every cycle)
             if self.aoa != 0.0:

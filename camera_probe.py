@@ -80,6 +80,24 @@ def main():
                 time.sleep(0.12)
             cap.release()
             if best is not None and best_mean >= 12.0:
+                # Software brightness boost: apply CLAHE contrast enhancement when the
+                # frame is dark (room lighting is poor). Preserves detail while lifting
+                # dark frames to usable brightness for the RF overlay / operator view.
+                try:
+                    if best_mean < 60.0:
+                        _lab = cv2.cvtColor(best, cv2.COLOR_BGR2LAB)
+                        _l, _a, _b = cv2.split(_lab)
+                        _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                        _l2 = _clahe.apply(_l)
+                        # Brightness lift: scale L channel up toward 110-130 target mean
+                        _target = 120.0
+                        _cur = float(_l2.mean())
+                        if _cur > 0:
+                            _l2 = cv2.convertScaleAbs(_l2, alpha=min(2.2, _target / _cur), beta=6)
+                        _lab2 = cv2.merge([_l2, _a, _b])
+                        best = cv2.cvtColor(_lab2, cv2.COLOR_LAB2BGR)
+                except Exception:
+                    pass
                 # Only overwrite when the new frame is brighter than what we already
                 # have (or we have nothing). Prevents dark/fuzzy frames replacing a
                 # good live image.
