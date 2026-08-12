@@ -93,6 +93,7 @@ var baseLayers = {'Streets (OSM)': osmLayer, 'Satellite (Esri)': satLayer, 'Sate
 L.control.layers(baseLayers, null, {position:'bottomright'}).addTo(map);
 
 var markerLayer = L.layerGroup().addTo(map);
+var rfHeatLayer = L.layerGroup().addTo(map);
 var rangeRings = L.layerGroup(); // hidden by default
 var aoaLine = null;
 var hullLine = null;
@@ -102,17 +103,44 @@ function toggleHeat(){
   var btn = document.getElementById('heat-btn');
   if(_heatOn){
     markerLayer.addTo(map);
+    rfHeatLayer.addTo(map);
     if(hullLine) hullLine.addTo(map);
     if(aoaLine) aoaLine.addTo(map);
     btn.textContent = 'HEAT: ON';
     btn.style.opacity = '1';
   } else {
     map.removeLayer(markerLayer);
+    map.removeLayer(rfHeatLayer);
     if(hullLine) map.removeLayer(hullLine);
     if(aoaLine) map.removeLayer(aoaLine);
     btn.textContent = 'HEAT: OFF';
     btn.style.opacity = '0.5';
   }
+}
+
+// RF bearing heatmap: radial gray lines from home, opacity scaled by detection count
+function drawRfHeat(bh){
+  rfHeatLayer.clearLayers();
+  if(!bh || !bh.length) return;
+  var maxC = 1;
+  bh.forEach(function(e){ if(e.count > maxC) maxC = e.count; });
+  bh.forEach(function(e){
+    var b = parseFloat(e.bearing);
+    if(isNaN(b)) return;
+    var rad = b * Math.PI / 180;
+    var len = 1500 + (e.count / maxC) * 6000;  // 1.5km to 7.5km based on intensity
+    var endLat = home[0] + Math.cos(rad) * len / 111320;
+    var endLon = home[1] + Math.sin(rad) * len / (111320 * Math.cos(home[0] * Math.PI/180));
+    var alpha = 0.12 + (e.count / maxC) * 0.55;
+    L.polyline([home, [endLat, endLon]], {
+      color: '#e8943a', weight: 2, opacity: alpha, dashArray: '2,6'
+    }).addTo(rfHeatLayer);
+    // Intensity dot at endpoint
+    L.circleMarker([endLat, endLon], {
+      radius: 2 + (e.count / maxC) * 5, color: '#e8943a',
+      fillColor: '#e8943a', fillOpacity: alpha, weight: 0
+    }).addTo(rfHeatLayer);
+  });
 }
 
 L.circleMarker(home, {radius:8, fillColor:'#3ac8a0', color:'#fff', weight:3, fillOpacity:0.9})
@@ -217,6 +245,8 @@ function update() {
     drawSpec(document.getElementById('us-lap'), us.laptop, 'lap', null, 24000);
 
     // Map markers â€” ALL sources get bearing lines + coordinate markers if available
+    // RF heatmap overlay from API bearing_heatmap data
+    try { drawRfHeat(d.bearing_heatmap || []); } catch(e) {}
     // Skip map-layer rebuild when data is unchanged (prevents 4s flicker)
     var sig = JSON.stringify(sources.map(function(s){
       return [s.freq||0, Math.round((s.snr||0)*10)/10, s.bearing||null, s.lat||null, s.lon||null, s.classification||''];
@@ -236,6 +266,7 @@ function update() {
       var bear = s.bearing;
       var hasBear = bear != null && Math.abs(bear) > 0.5;
       var hasCoord = s.lat && s.lon && Math.abs(s.lat) > 0.001;
+      var isUS = freq > 15000 && freq < 200000;  // ultrasonic band: distinct purple overlay
       
       // Bearing lines from home for ALL sources with bearing (even without coords)
       if (hasBear) {
@@ -243,15 +274,16 @@ function update() {
         var lineLen = s.range ? s.range : 5000;  // use range if available, else 5km default
         var endLat = home[0] + Math.cos(rad) * lineLen / 111320;
         var endLon = home[1] + Math.sin(rad) * lineLen / (111320 * Math.cos(home[0] * Math.PI/180));
+        var lineColor = isUS ? '#c03ae8' : color;  // ultrasonic = purple
         var line = L.polyline([home, [endLat, endLon]], {
-          color: color, weight: 2.5, opacity: 0.85, dashArray: '8,3'
+          color: lineColor, weight: isUS ? 3 : 2.5, opacity: isUS ? 0.9 : 0.85, dashArray: isUS ? '2,2' : '8,3'
         });
         bearingLines.push(line);
         
         // Endpoint marker on bearing line
-        var epR = 7;
+        var epR = isUS ? 6 : 7;
         L.circleMarker([endLat, endLon], {
-          radius: epR, color: color, fillColor: color, fillOpacity: 0.8, weight: 1
+          radius: epR, color: lineColor, fillColor: lineColor, fillOpacity: 0.8, weight: 1
         }).addTo(markerLayer);
       }
       
