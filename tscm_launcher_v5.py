@@ -38,8 +38,18 @@ def _fast_resolve(self, current_lat, current_lon):
         detector = latest.get('detector', '')
         snr = latest.get('snr', 0)
         
-        # Safe bearing: use latest, or None
-        bearing = safe.safe_bearing(latest.get('bearing'))
+        # Safe bearing: use latest, or None.
+        # [AUDIT 2026-08-17] respect no_bearing + bearing_injected: do NOT position
+        # sources whose bearing is absent (0.0/None) or was auto-injected from the
+        # shared AoA. This was collapsing 1700+ sources onto a single artificial
+        # bearing line (the 'fake line pattern' MEMORY.md warns about).
+        _b = latest.get('bearing', 0)
+        _no_b = latest.get('no_bearing', True)
+        _injected = latest.get('bearing_injected', False)
+        if _b in (None, 0.0) or _no_b or _injected:
+            bearing = None
+        else:
+            bearing = safe.safe_bearing(_b)
         rng = latest.get('range')
         
         # Compute lat/lon only if we have bearing + range
@@ -134,9 +144,23 @@ def _fast_resolve(self, current_lat, current_lon):
     
     return results
 
-# Apply the patch
-tscm_final.SourceLocalizationEngine.resolve_sources = _fast_resolve
-print("LAUNCHER v5: resolve_sources replaced with fast safe path")
+# Apply the patch: run the REAL resolver (full cross-sensor/triangulation), but
+# fall back to the fast path on ANY crash so the system never goes down.
+def _safe_resolve(self, current_lat, current_lon):
+    try:
+        return _orig_resolve(self, current_lat, current_lon)
+    except Exception as _e:
+        import traceback
+        try:
+            with open(os.path.join(workspace, 'resolve_crash.log'), 'a') as _f:
+                _f.write('%s [RESOLVE-CRASH] %r\n%s\n' % (
+                    time.strftime('%Y-%m-%d %H:%M:%S'), _e, traceback.format_exc()))
+        except Exception:
+            pass
+        return _fast_resolve(self, current_lat, current_lon)
+
+tscm_final.SourceLocalizationEngine.resolve_sources = _safe_resolve
+print("LAUNCHER v5: resolve_sources -> real resolver with fast-path fallback")
 
 # Also patch the crash-prone internal math methods
 if hasattr(tscm_final.SourceLocalizationEngine, '_bearing_to_xy'):

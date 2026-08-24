@@ -44,8 +44,12 @@ body{background:#000;overflow:hidden;font:12px 'Segoe UI',system-ui,sans-serif}
 </head>
 <body>
 <div id="map"></div>
-<div id="side"><div style="color:#e8943a;font-size:9px;margin-bottom:4px">BOOKMARK: http://localhost:8081/live</div>
+<div id="side"><div style="color:#e8943a;font-size:9px;margin-bottom:4px">BOOKMARK: http://localhost:8080/live</div>
   <h3>â—† DETECTIONS <span id="side-count" style="color:#888">--</span></h3>
+  <div id="cat-filter" style="display:flex;flex-wrap:wrap;gap:2px;margin:4px 0 6px"></div>
+  <div id="cat-summary" style="color:#667;font-size:8px;margin:0 0 4px;line-height:1.5"></div>
+  <div id="kind-filter" style="display:flex;flex-wrap:wrap;gap:2px;margin:0 0 6px"></div>
+  <div id="kind-summary" style="color:#667;font-size:8px;margin:0 0 4px;line-height:1.5"></div>
   <div id="side-list" style="flex:1;overflow-y:auto"></div>
 </div>
 <div id="status">
@@ -100,6 +104,78 @@ var rangeRings = L.layerGroup(); // hidden by default
 var aoaLine = null;
 var hullLine = null;
 var _heatOn = true;
+var _catFilter = 'all';
+var CAT_DEFS = [
+  {id:'mw_voice', label:'MW VOICE', color:'#e848b0'},
+  {id:'tracking', label:'TRACKING', color:'#e8943a'},
+  {id:'ultrasonic_sonic', label:'US/SONIC', color:'#c03ae8'},
+  {id:'human_tracking', label:'HUMAN TRK', color:'#ff4040'}
+];
+function catMatch(s){
+  if(_catFilter === 'all') return true;
+  var cats = s.categories || [];
+  return cats.indexOf(_catFilter) >= 0;
+}
+function setCat(id){
+  _catFilter = id;
+  window._lastSig = null;
+  var btns = document.querySelectorAll('.catbtn');
+  for(var i=0;i<btns.length;i++){
+    btns[i].style.opacity = (btns[i].getAttribute('data-cat') === id) ? '1' : '0.35';
+  }
+  update();
+}
+function buildCatUI(){
+  var bar = document.getElementById('cat-filter');
+  if(!bar) return;
+  var ids = ['all'].concat(CAT_DEFS.map(function(c){return c.id;}));
+  var labels = ['ALL'].concat(CAT_DEFS.map(function(c){return c.label;}));
+  var colors = ['#e8943a'].concat(CAT_DEFS.map(function(c){return c.color;}));
+  var html = '';
+  for(var i=0;i<ids.length;i++){
+    html += '<button class="catbtn" data-cat="' + ids[i] + '" style="background:rgba(255,255,255,0.06);border:1px solid ' + colors[i] + ';color:' + colors[i] + ';font:8px Segoe UI;padding:2px 5px;border-radius:3px;cursor:pointer;opacity:0.35;margin-right:2px">' + labels[i] + '</button>';
+  }
+  bar.innerHTML = html;
+  bar.onclick = function(e){
+    var t = e.target;
+    if(t && t.className === 'catbtn'){ setCat(t.getAttribute('data-cat')); }
+  };
+}
+var _kindFilter = 'all';
+var KIND_DEFS = [
+  {id:'human', label:'HUMAN', color:'#3ac8a0'},
+  {id:'transmitter', label:'TX', color:'#4aa8e8'},
+  {id:'device', label:'DEVICE', color:'#e8483a'}
+];
+function kindMatch(s){
+  if(_kindFilter === 'all') return true;
+  return (s.source_kind === _kindFilter);
+}
+function setKind(id){
+  _kindFilter = id;
+  window._lastSig = null;
+  var btns = document.querySelectorAll('.kindbtn');
+  for(var i=0;i<btns.length;i++){
+    btns[i].style.opacity = (btns[i].getAttribute('data-kind') === id) ? '1' : '0.35';
+  }
+  update();
+}
+function buildKindUI(){
+  var bar = document.getElementById('kind-filter');
+  if(!bar) return;
+  var ids = ['all'].concat(KIND_DEFS.map(function(c){return c.id;}));
+  var labels = ['ALL'].concat(KIND_DEFS.map(function(c){return c.label;}));
+  var colors = ['#e8943a'].concat(KIND_DEFS.map(function(c){return c.color;}));
+  var html = '';
+  for(var i=0;i<ids.length;i++){
+    html += '<button class="kindbtn" data-kind="' + ids[i] + '" style="background:rgba(255,255,255,0.06);border:1px solid ' + colors[i] + ';color:' + colors[i] + ';font:8px Segoe UI;padding:2px 5px;border-radius:3px;cursor:pointer;opacity:0.35;margin-right:2px">' + labels[i] + '</button>';
+  }
+  bar.innerHTML = html;
+  bar.onclick = function(e){
+    var t = e.target;
+    if(t && t.className === 'kindbtn'){ setKind(t.getAttribute('data-kind')); }
+  };
+}
 function toggleHeat(){
   _heatOn = !_heatOn;
   var btn = document.getElementById('heat-btn');
@@ -207,6 +283,7 @@ function update() {
     var sideHTML = '';
     var mappedCount = 0;
     sources.forEach(function(s,i){
+      if(!catMatch(s) || !kindMatch(s)) return;
       var hasCoord = s.lat && s.lon && Math.abs(s.lat)>0.001;
       if(hasCoord) mappedCount++;
       var color = getColor(s.detector||'', s.classification||'');
@@ -215,13 +292,25 @@ function update() {
       var fs = freq>1e6?(freq/1e6).toFixed(1)+'M':(freq>1e3?(freq/1e3).toFixed(1)+'k':freq.toFixed(0));
       var bear = s.bearing ? Math.round(s.bearing)+'\u00B0' : '';
       var icon = hasCoord ? '\u25CF' : '\u25D8';
+      var org = s.origin || '';
+      var orgC = org==='human'?'#3ac8a0':(org==='synthetic'?'#e8483a':(org==='rf'?'#4aa8e8':'#667'));
+      var orgTag = org ? ' <span style="color:'+orgC+'">'+org+'</span>' : '';
+      var thTag = s.targets_human ? ' <span style="color:#ff4040">&#9763;</span>' : '';
+      var kind = s.source_kind || '';
+      var kindTag = kind ? ' <span style="color:#4aa8e8;font-weight:700">['+kind+(s.device_subtype?'/'+s.device_subtype:'')+']</span>' : '';
       sideHTML += '<div class="det-row">'+
-        '<span><span style="color:'+color+'">'+icon+'</span> '+escH(name)+'</span>'+
+        '<span><span style="color:'+color+'">'+icon+'</span> '+escH(name)+kindTag+orgTag+thTag+'</span>'+
         '<span class="bear">'+bear+(bear?' ':'')+fs+'</span></div>';
     });
     document.getElementById('side-list').innerHTML = sideHTML || '<div style="color:#666;padding:10px">NO DETECTIONS</div>';
     document.getElementById('side-count').textContent = sources.length + ' total';
     document.getElementById('st-mapped').textContent = mappedCount + ' mapped';
+    var tc = d.threat_categories || {};
+    var sumEl = document.getElementById('cat-summary');
+    if(sumEl){ sumEl.innerHTML = 'MW-V '+(tc.mw_voice||0)+' | TRK '+(tc.tracking||0)+' | US '+(tc.ultrasonic_sonic||0)+' | HUMAN '+(tc.human_tracking||0); }
+    var ks = d.kind_summary || {};
+    var kindEl = document.getElementById('kind-summary');
+    if(kindEl){ kindEl.innerHTML = 'HUMAN '+(ks.human||0)+' | TX '+(ks.transmitter||0)+' | DEVICE '+(ks.device||0); }
     // Equipment status
     var obs = d.observer || {};
     document.getElementById('st-brf').textContent = obs.bladerf ? 'ON' : 'OFF';
@@ -271,6 +360,7 @@ function update() {
     var positions = [[home[0], home[1]]];
     var bearingLines = [];
     sources.forEach(function(s){
+      if(!catMatch(s) || !kindMatch(s)) return;
       var color = getColor(s.detector||'', s.classification||'');
       var freq = s.freq||0;
       var fs = freq>1e9?(freq/1e9).toFixed(2)+'G':(freq>1e6?(freq/1e6).toFixed(1)+'M':(freq>1e3?(freq/1e3).toFixed(1)+'k':freq.toFixed(0)+'Hz'));
@@ -307,7 +397,8 @@ function update() {
         
         var html = '<b style="color:'+color+'">'+escH(s.detector||'unknown')+'</b><br>'+
           'Freq: '+fs+' | '+escH(s.classification||'--')+'<br>'+
-          'Bearing: '+(hasBear?Math.round(bear)+'\u00B0':'--')+'<br>'+
+          'Origin: '+(s.origin||'--')+' | Cat: '+(s.category||'--')+'<br>'+
+          'Kind: '+(s.source_kind||'--')+(s.device_subtype?'/'+s.device_subtype:'')+'<br>'+          'Bearing: '+(hasBear?Math.round(bear)+'\u00B0':'--')+'<br>'+
           (s.triangulated?'<b style="color:#3ac8a0">TRIANGULATED</b> ':'')+
           'Obs: '+(s.observations||1);
         m.bindTooltip(html, {direction:'top', className:'det-tooltip', offset:[0,-8]});
@@ -378,6 +469,8 @@ function drawSpec(canvas, spec, histKey, markers, maxF){
 }
 
 update();
+buildCatUI();
+buildKindUI();
 setInterval(update, 4000);
 // Live camera: refresh every 3s, retry on error (box is fixed-size, never flashes)
 // CAM mode toggle: RAW (/camera/snap) vs RF overlay (/camera/rf)

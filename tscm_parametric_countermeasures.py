@@ -220,7 +220,9 @@ class UltrasonicNoiseJammer:
       # Play noise_samples through speakers
     """
 
-    def __init__(self, output_fs=48000, band=(20000, 23500), ramp_ms=500):
+    def __init__(self, output_fs=48000, band=(20000, 23500), ramp_ms=500,
+                 speaker_fallback=False, speaker_band=(14000, 18000),
+                 speaker_device=None, speaker_level=0.15):
         self.fs = output_fs
         self.band = band  # (low_cut, high_cut) Hz
         self.ramp_samples = int(output_fs * ramp_ms / 1000)
@@ -228,12 +230,32 @@ class UltrasonicNoiseJammer:
         self.active = False
         self._rng = np.random.RandomState()
 
+        # Speaker fallback (14-18 kHz): laptop speakers CANNOT radiate the
+        # 20-23.5 kHz band, but they CAN radiate 14-18 kHz which covers the
+        # observed 15.9 kHz 'LAPTOP SILENT SOUND' V2K carrier. Gated OFF by
+        # default; operator must set speaker_fallback=True (audible to young
+        # people and pets - consent required).
+        self.speaker_fallback = speaker_fallback
+        self.speaker_band = speaker_band
+        self.speaker_device = speaker_device
+        self.speaker_level = speaker_level
+        self._spk_stream = None
+        self._spk_gain = 0.0
+        self._spk_ramp = 0
+
         # Pre-compute bandpass filter
         nyq = output_fs / 2
         self._bpf_b, self._bpf_a = firwin(
             257, [band[0] / nyq, band[1] / nyq],
             pass_zero=False, window='hamming'
         ), [1.0]
+
+        # Speaker-band filter (14-18 kHz)
+        self._spk_bpf_b, self._spk_bpf_a = firwin(
+            257, [speaker_band[0] / nyq, speaker_band[1] / nyq],
+            pass_zero=False, window='hamming'
+        ), [1.0]
+        self._spk_zi = np.zeros(len(self._spk_bpf_b) - 1)
 
         # Filter state for streaming
         self._zi = np.zeros(len(self._bpf_b) - 1)
@@ -263,12 +285,15 @@ class UltrasonicNoiseJammer:
             self._ramp_counter = 0
             self._current_gain = 0.0
             logger.warning('JAMMER ENABLED — ultrasonic noise injection active')
+            if self.speaker_fallback:
+                self._start_speaker_stream()
         else:
             logger.info('Jammer already enabled')
 
     def disable(self):
         """Deactivate the jammer with ramp-down."""
         self.enabled = False
+        self._stop_speaker_stream()
         logger.info('Jammer disabled — ramping down')
 
     def auto_decide(self, attack_confidence, beat_pair_count):
@@ -355,6 +380,84 @@ class UltrasonicNoiseJammer:
             noise_filt *= self._current_gain
 
         return noise_filt.astype(np.float32), self._current_gain
+
+    def generate_fallback(self, n_samples):
+        """
+        Generate n_samples of speaker-radiatable jamming noise (14-18 kHz).
+        Returns zeros while disabled. Used by the speaker fallback stream.
+        """
+        if not self.enabled and self._spk_gain < 0.001:
+            return np.zeros(n_samples, dtype=np.float32)
+        noise = self._rng.randn(n_samples).astype(np.float32)
+        if n_samples > 0:
+            t = np.arange(n_samples) / self.fs + self._mod_phase
+            am = 0.5 + 0.5 * np.sin(2 * np.pi * self._mod_freq * t)
+            self._mod_phase = (self._mod_phase + n_samples / self.fs * self._mod_freq) % (2 * np.pi)
+            noise = noise * am.astype(np.float32)
+        noise_filt, self._spk_zi = lfilter(
+            self._spk_bpf_b, self._spk_bpf_a, noise, zi=self._spk_zi
+        )
+        target_gain = self.level if self.enabled else 0.0
+        gain_step = (target_gain - self._spk_gain) / max(self.ramp_samples, 1)
+        if abs(target_gain - self._spk_gain) > 0.001:
+            for i in range(min(n_samples, self.ramp_samples)):
+                self._spk_gain += gain_step
+                noise_filt[i] *= self._spk_gain
+            if n_samples > self.ramp_samples:
+                self._spk_gain = target_gain
+                noise_filt[self.ramp_samples:] *= self._spk_gain
+        else:
+            self._spk_gain = target_gain
+            noise_filt *= self._spk_gain
+        return (noise_filt * self.speaker_level).astype(np.float32)
+
+    @staticmethod
+    def _pick_speaker_device():
+        """Prefer Realtek speakers; avoid NVIDIA Broadcast (heap-corruptor driver)
+        and SteelSeries Sonar virtual loopbacks that could feed the monitors."""
+        try:
+            import sounddevice as sd
+            devs = sd.query_devices()
+            for i, d in enumerate(devs):
+                name = str(d.get('name', ''))
+                if d.get('max_output_channels', 0) > 0 and 'Realtek' in name and 'Speakers' in name:
+                    return i
+        except Exception:
+            pass
+        return None
+
+    def _start_speaker_stream(self):
+        if self._spk_stream is not None or not self.speaker_fallback:
+            return
+        try:
+            import sounddevice as sd
+            dev = self.speaker_device
+            if dev is None:
+                dev = self._pick_speaker_device()
+            self._spk_stream = sd.OutputStream(
+                samplerate=self.fs, channels=1, device=dev,
+                callback=self._spk_callback, blocksize=2048)
+            self._spk_stream.start()
+            logger.warning('JAMMER speaker fallback: emitting %s Hz on device %s (level %.2f)' % (
+                self.speaker_band, dev, self.speaker_level))
+        except Exception as e:
+            logger.error('JAMMER speaker stream error: %s' % str(e)[:120])
+            self._spk_stream = None
+
+    def _spk_callback(self, outdata, frames, time_info, status):
+        x = self.generate_fallback(frames)
+        outdata[:, 0] = x
+
+    def _stop_speaker_stream(self):
+        if self._spk_stream is not None:
+            try:
+                self._spk_stream.stop()
+                self._spk_stream.close()
+            except Exception:
+                pass
+            self._spk_stream = None
+        self._spk_gain = 0.0
+        self._spk_zi[:] = 0.0
 
     def update_effectiveness(self, beat_pairs_before, beat_pairs_after):
         """

@@ -32,6 +32,8 @@ from tscm_parametric_countermeasures import (
     UltrasonicNoiseJammer,
     CrossLayerParametricCorrelator,
 )
+import usb_timing
+usb_mon = usb_timing.get_monitor()
 from socketserver import ThreadingMixIn
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -117,11 +119,11 @@ if os.path.isdir(_BLADERF_STANDALONE) and _BLADERF_STANDALONE not in os.environ.
 
 # ===================== CONFIGURATION =====================
 class Config:
-    # GPS - u-blox on COM4 (ZED-F9P on COM5 if available)
+    # GPS - RTK2 (u-blox ZED-F9P, VID_1546 PID_01A9) on COM4 - this IS the primary GPS
     # Anti-spoof: cross-check against HOME, reject jumps >500m
     # WiFi geolocation disabled (spoofable via C2 WiFi bridge)
-    GPS_PORT = 'COM4'    # u-blox GPS primary (confirmed)
-    GPS_PORT_2 = 'COM5'  # ZED-F9P fallback
+    GPS_PORT = 'COM4'    # RTK2 ZED-F9P primary (confirmed VID_1546 PID_01A9)
+    GPS_PORT_2 = 'COM5'  # secondary GPS (optional; not currently enumerated)
     GPS_PORT_3 = None    # disabled
     GPS_BAUD = 9600
     RTLSDR_ENABLED = True
@@ -141,7 +143,7 @@ class Config:
     BCI_PORT = 12345
 
     # Audio devices - auto-detect if None
-    PETTERSON_DEVICE_INDEX = 24  # Petterson M500-384kHz (index shifted from 20)  # M500-384kHz (Windows driver limit)
+    PETTERSON_DEVICE_INDEX = 25  # Petterson M500-384kHz (index drifted 20->24->25; resolved by name at runtime)
     PETTERSON_SAMPLE_RATE = 384000  # M500-384 max supported rate (device 24)
     # Multi-rate scanning: 500k, 384k, 250k, 192k, 96k, 48k
     PETTERSON_SCAN_RATES = [384000, 250000, 192000, 96000, 48000]  # device 24 only supports up to 384kHz
@@ -164,6 +166,13 @@ class Config:
     HACKRF_SAMPLE_RATE = 20e6
     HACKRF_GAIN = 30
     HACKRF_BIAS_TEE = True
+
+    # Ultrasonic jammer speaker fallback (14-18 kHz): laptop speakers cannot
+    # radiate 20-23.5 kHz, but CAN radiate 14-18 kHz which covers the observed
+    # 15.9 kHz 'LAPTOP SILENT SOUND' V2K carrier. DEFAULT OFF - audible to young
+    # people/pets; operator consent required before setting True.
+    JAMMER_SPEAKER_FALLBACK = False
+    JAMMER_SPEAKER_DEVICE = None  # None = auto-pick Realtek speakers
 
     # eCPRI
     ECPRI_FREQ = 3500e6
@@ -230,7 +239,8 @@ class Config:
     ARRAY_AXIS_DEGREES = 0  # ZERO BIAS - raw array orientation
 
     # Map
-    MAP_PORT = 8081
+    MAP_PORT = 8080   # restored baseline port (8081 was a temporary workaround since 2026-08-08)
+    MAP_PORT_FALLBACK = 8081  # only used if 8080 is occupied
     HOME_LAT = 41.51325   # fixed BladeRF position (no GPS)
     HOME_LON = -88.13368   # fixed BladeRF position (no GPS)
     # No GPS offsets - GPS is disabled
@@ -862,6 +872,10 @@ class SourceLocalizationEngine:
         try: snr = float(snr)
         except (TypeError, ValueError): snr = 0.0
         snr = max(-100.0, min(1000.0, snr))
+        # Reject meta-analysis detectors with no physical signal
+        _META_SKIP = {'coordinated_system', 'coordinated_c2'}
+        if detector_name in _META_SKIP:
+            return  # logged, never enters source tracking
         # Validate lat/lon are within physical ranges
         try:
             obs_lat = float(obs_lat); obs_lon = float(obs_lon)
@@ -911,16 +925,23 @@ class SourceLocalizationEngine:
                     bearing_deg = self.current_aoa
                     no_bearing = False
                     _aoa_injected = True
-                    if range_m is None and _in_bladerf_band and self.hackrf_range:
-                        range_m = self.hackrf_range
+                    # FIX 2026-08-20: no HackRF range for BladeRF-band sources (band mismatch)
 
             # 2. Intel Smart Sound acoustic AoA - all sources get this as fallback
             #    4-channel mic array provides spatial bearing for any acoustic or RF signal
             #    that has acoustic coupling (vibration, AM demod, body re-radiation)
+            #    FIX 2026-08-12: gate by physical plausibility. Array Nyquist is 24 kHz
+            #    (48k sampling); Petterson-only ultrasonic carriers (>24 kHz) cannot be
+            #    spatially resolved by it. Injecting the array bearing there produced a
+            #    fake identical bearing (-1.6379 deg) on 270+ sources. Near-axis dead
+            #    zone (|b| < 2 deg) also rejected as array self-noise.
             if not _aoa_injected and self.acoustic_aoa is not None and self.acoustic_aoa != 0.0:
-                bearing_deg = self.acoustic_aoa
-                no_bearing = False
-                _aoa_injected = True
+                _in_array_band = freq <= 24000.0
+                _away_from_axis = abs(self.acoustic_aoa) >= 2.0
+                if _in_array_band and _away_from_axis:
+                    bearing_deg = self.acoustic_aoa
+                    no_bearing = False
+                    _aoa_injected = True
 
             # 3. HackRF ferrite bearing - only for HackRF/ferrite detectors
             #    Ferrite loop provides direction for RF signals in the HackRF band
@@ -938,10 +959,12 @@ class SourceLocalizationEngine:
         if isinstance(bearing_deg, float) and math.isnan(bearing_deg):
             bearing_deg = 0.0
             no_bearing = True
-        # Inject range estimate for ALL RF-band detections (>1 MHz)
-        # Re-enabled with massively scaled range factor to prevent
-        # artificial 30-500m clustering. Ferrite computes ~31km at 570MHz.
-        if range_m is None and freq > 1e6 and self.hackrf_range:
+        # FIX 2026-08-20: inject HackRF range ONLY into HackRF/ferrite sources.
+        # Blanket-injecting self.hackrf_range into every RF source (>1 MHz) gave
+        # non-HackRF sources (BladeRF 2.4 GHz, MW 2.45 GHz) the same 450/570 MHz
+        # distance, producing artificial 30-500 m clustering. Non-HackRF sources
+        # now fall through to per-source SNR-based range estimation.
+        if range_m is None and freq > 1e6 and self.hackrf_range and ('hackrf' in _det_lower or 'ferrite' in _det_lower):
             range_m = self.hackrf_range
         # Use HackRF fixed position for HackRF detections (dual-sensor triangulation)
         # BladeRF detections use GPS/observer position; HackRF detections use HackRF's
@@ -974,6 +997,7 @@ class SourceLocalizationEngine:
             'freq': freq, 'class': classification,
             'detector': detector_name, 'snr': snr,
             'no_bearing': no_bearing,
+            'bearing_injected': _aoa_injected,
             'source_type': source_type
         })
         self.cycle_detections.append({
@@ -994,6 +1018,7 @@ class SourceLocalizationEngine:
                     'freq': o['freq'], 'class': o['class'],
                     'detector': o['detector'], 'snr': o.get('snr', 0),
                     'no_bearing': o.get('no_bearing', False),
+                    'bearing_injected': o.get('bearing_injected', False),
                     'source_type': o.get('source_type', 'unknown')
                 } for o in obs_list]
             with open(path, 'w') as f:
@@ -1014,6 +1039,11 @@ class SourceLocalizationEngine:
                 for o in obs_list:
                     # Only load observations from last 1 hour (extended from 5 min)
                     if now - o.get('ts', 0) > 3600: continue
+                    # Migration: pre-C1 saves lack 'bearing_injected'. Treat a loaded
+                    # bearing-bearing observation conservatively as injected until it is
+                    # re-observed with the explicit flag (prevents phantom positions).
+                    if 'bearing_injected' not in o:
+                        o['bearing_injected'] = bool(o.get('bearing', 0) != 0.0 and not o.get('no_bearing', True))
                     self.observations[fp].append(o)
                     count += 1
             return count
@@ -1102,6 +1132,15 @@ class SourceLocalizationEngine:
     def resolve_sources(self, current_lat, current_lon):
         now = time.time()
         self.log.info(f"[RESOLVE] {len(self.observations)} fingerprints, hackrf=({self.hackrf_lat},{self.hackrf_lon}), bladerf_rms={self.bladerf_rms}, hackrf_rms={self.hackrf_rms}")
+        # [FIX 2026-08-19] GC empty observation fingerprints (deques drained
+        # by _prune_old) so observations/sources dicts stop growing unbounded.
+        try:
+            _empty_fps = [fp for fp, o in self.observations.items() if not o]
+            for _fp in _empty_fps:
+                self.observations.pop(_fp, None)
+                self.sources.pop(_fp, None)
+        except Exception:
+            pass
         results = []
         for fp, obs_list in self.observations.items():
             self._prune_old(fp)
@@ -1129,7 +1168,7 @@ class SourceLocalizationEngine:
             # For triangulation, prefer the most recent observation with a real bearing.
             # First-cycle observations may have bearing=0.0 (AoA not yet computed).
             for o in reversed(obs):
-                if o.get('bearing', 0) != 0.0:
+                if o.get('bearing', 0) != 0.0 and not o.get('no_bearing', True) and not o.get('bearing_injected', False):
                     latest = o
                     break
             classification = latest['class']
@@ -1171,7 +1210,7 @@ class SourceLocalizationEngine:
             #
             # has_real_bearing restored - sources NEED bearing_range_est to appear.
             # Range scale increased to prevent compression.
-            has_real_bearing = latest.get('bearing', 0) != 0.0 and not latest.get('no_bearing', True)
+            has_real_bearing = latest.get('bearing', 0) != 0.0 and not latest.get('no_bearing', True) and not latest.get('bearing_injected', False)
             has_measured_range = latest.get('range') is not None and latest.get('range', 0) > 0
             # Accept ANY source with bearing+range, regardless of frequency.
             # Ultrasound (20kHz-) and radar bodies need coordinates too.
@@ -1181,7 +1220,7 @@ class SourceLocalizationEngine:
             measured_rng = latest.get('range')
             is_person = 'radar_water' in detector.lower() or classification == 'person'
             is_victim_us = classification == 'victim' and latest.get('freq', 0) > 1000
-            if is_person or is_victim_us:
+            if (is_person or is_victim_us) and latest.get('bearing', 0) != 0.0 and not latest.get('no_bearing', True):
                 is_confirmed = True
                 # Fallback range if no measured range: use SNR-based estimate
                 if measured_rng is None:
@@ -1298,7 +1337,7 @@ class SourceLocalizationEngine:
                         estimated_range = max(100, 600 * (3 / max(avg_snr, 0.3)))
                 if not estimated_range or estimated_range <= 0:
                     _det = latest.get('detector', '')
-                    if 'ferrite' in _det: estimated_range = 200
+                    if 'ferrite' in _det: estimated_range = self.hackrf_range if self.hackrf_range else 500
                     elif 'real_transmitter' in _det: estimated_range = 300
                     elif 'reradiator' in _det: estimated_range = 100
                     elif 'watcher' in _det: estimated_range = 400
@@ -1306,7 +1345,7 @@ class SourceLocalizationEngine:
                     elif _freq > 1e6: estimated_range = 300
                     else: estimated_range = 500
 
-            if latest['bearing'] == 0.0:
+            if not latest.get('bearing', 0) or latest.get('no_bearing', True) or latest.get('bearing_injected', False):
                 # Check if any observation has a valid bearing to propagate
                 _best_bearing = None
                 _best_range = None
@@ -1320,6 +1359,7 @@ class SourceLocalizationEngine:
                     'last_seen': now, 'freq': freq, 'detector': detector,
                     'bearing': _best_bearing,
                     'range': _best_range,
+                    'snr': latest.get('snr', 0),
                     'method': 'at_observer', 'observations': len(obs),
                     'triangulated': False,
                     'propagation_mode': 'los'}
@@ -1456,6 +1496,9 @@ class SourceLocalizationEngine:
                             # Temporal guard: observations must be within 30 seconds
                             if abs(b_obs.get('ts', 0) - h_obs.get('ts', 0)) > 30:
                                 continue  # too far apart in time
+                            _bdiff = abs(b_obs['bearing'] - h_obs['bearing']) % 360
+                            if min(_bdiff, 360 - _bdiff) < 20.0:
+                                continue  # near-parallel -> phantom intersection
                             pt = self._intersect_bearings(
                                 b_obs['lat'], b_obs['lon'], b_obs['bearing'],
                                 h_obs['lat'], h_obs['lon'], h_obs['bearing'])
@@ -2443,8 +2486,11 @@ class BroadbandJamDetector:
         # 2. Swept-frequency jamming detection
         # Look for noise peak moving across bands in a pattern
         if len(broadband_bands) > 0:
-            current_peak_band = broadband_bands[0][0]  # highest excess band
-            if self.sweep_peak_band and self.sweep_peak_band != current_peak_band:
+            # ANTI-BIAS (2026-08-16): OPEN_ raster bands rotate from our own
+            # coverage sweep, not adversary frequency sweeping - exclude them
+            _pk_candidates = [b for b, _, _, _ in broadband_bands if not b.startswith('OPEN_')]
+            current_peak_band = _pk_candidates[0] if _pk_candidates else None
+            if current_peak_band and self.sweep_peak_band and self.sweep_peak_band != current_peak_band:
                 # Peak moved to a different band - check if it follows a pattern
                 self.sweep_band_sequence.append((now, self.sweep_peak_band, current_peak_band))
                 # Check for consistent direction (ascending or descending frequency)
@@ -3032,35 +3078,53 @@ class FrequencyHoppingTracker:
         if now is None:
             now = ts
         results = []
+        # Consolidate ALL carriers in the window into distinct bandwidth-matched
+        # clusters (single pass). The previous O(n^2) per-index grouping emitted
+        # one duplicate "FHSS" per carrier index, flooding detections.log and
+        # inflating false FHSS detections (37 hops -> 36 -> ... -> 3 countdown).
         freq_list = list(self.carriers.values())
+        if len(freq_list) < self.min_stops:
+            return results
+        clusters = []
+        used = set()
         for i in range(len(freq_list)):
+            if i in used:
+                continue
             group = [freq_list[i]]
-            for j in range(i+1, len(freq_list)):
-                fi, fj = freq_list[i], freq_list[j]
+            used.add(i)
+            fi = freq_list[i]
+            for j in range(i + 1, len(freq_list)):
+                if j in used:
+                    continue
+                fj = freq_list[j]
                 if fj.get('bw') and fi.get('bw'):
                     ratio = max(fi['bw'], fj['bw']) / (min(fi['bw'], fj['bw']) + 1e-6)
                     if ratio > 1.3:
                         continue
                 group.append(fj)
-            if len(group) >= self.min_stops:
-                freqs = sorted([g['freq'] for g in group])
-                snrs = [g['snr'] for g in group]
-                mean_snr = sum(snrs) / len(snrs)
-                snr_var = sum((s - mean_snr)**2 for s in snrs) / len(snrs)
-                if snr_var < mean_snr * 2:
-                    span_mhz = (max(freqs) - min(freqs)) / 1e6
-                    hop_rate = len(group) / self.max_window
-                    avg_bearing = None
-                    bearings = [g['bearing'] for g in group if g.get('bearing')]
-                    if len(bearings) >= 2:
-                        avg_bearing = sum(bearings) / len(bearings)
-                    results.append({
-                        'freq_min': min(freqs), 'freq_max': max(freqs),
-                        'span_mhz': span_mhz, 'hop_count': len(group),
-                        'hop_rate': hop_rate, 'mean_snr': mean_snr,
-                        'bearing': avg_bearing,
-                        'classification': 'fhss' if span_mhz > 5 else 'narrow_fhss'
-                    })
+                used.add(j)
+            clusters.append(group)
+        for group in clusters:
+            if len(group) < self.min_stops:
+                continue
+            freqs = sorted([g['freq'] for g in group])
+            snrs = [g['snr'] for g in group]
+            mean_snr = sum(snrs) / len(snrs)
+            snr_var = sum((s - mean_snr)**2 for s in snrs) / len(snrs)
+            if snr_var < mean_snr * 2:
+                span_mhz = (max(freqs) - min(freqs)) / 1e6
+                hop_rate = len(group) / self.max_window
+                avg_bearing = None
+                bearings = [g['bearing'] for g in group if g.get('bearing')]
+                if len(bearings) >= 2:
+                    avg_bearing = sum(bearings) / len(bearings)
+                results.append({
+                    'freq_min': min(freqs), 'freq_max': max(freqs),
+                    'span_mhz': span_mhz, 'hop_count': len(group),
+                    'hop_rate': hop_rate, 'mean_snr': mean_snr,
+                    'bearing': avg_bearing,
+                    'classification': 'fhss' if span_mhz > 5 else 'narrow_fhss'
+                })
         return results
 
 class InjectionLockingDetector:
@@ -3070,9 +3134,12 @@ class InjectionLockingDetector:
         f, Pxx = periodogram(phase_det, fs)
         peaks, _ = find_peaks(Pxx, height=np.median(Pxx)*2, distance=20)
         if len(peaks) > 2:
+            peak_heights = Pxx[peaks]
+            snr_est = float(np.max(peak_heights) / (np.median(Pxx) + 1e-12))
             return [{'detector': 'injection_locking',
                      'peak_freqs': f[peaks].tolist(),
-                     'freq': float(f[peaks[0]]) if len(peaks) > 0 else 0}]
+                     'freq': float(f[peaks[0]]) if len(peaks) > 0 else 0,
+                     'snr': snr_est}]
         return []
 
 class ParametricAmplificationDetector:
@@ -5127,6 +5194,9 @@ class MapHandler(BaseHTTPRequestHandler):
                     'auto_mode': getattr(pj, 'auto_mode', False) if (tscm and hasattr(tscm, 'us_jammer')) else False,
                     'effectiveness': pj.effectiveness if (tscm and hasattr(tscm, 'us_jammer')) else 0.0,
                     'level': pj.level if (tscm and hasattr(tscm, 'us_jammer')) else 0.0,
+                    'speaker_fallback': getattr(pj, 'speaker_fallback', False) if (tscm and hasattr(tscm, 'us_jammer')) else False,
+                    'speaker_band': list(getattr(pj, 'speaker_band', (14000, 18000))) if (tscm and hasattr(tscm, 'us_jammer')) else [14000, 18000],
+                    'speaker_active': getattr(pj, '_spk_stream', None) is not None if (tscm and hasattr(tscm, 'us_jammer')) else False,
                 }
             }
             json_bytes = json.dumps(data, default=str).encode('utf-8')
@@ -5295,6 +5365,19 @@ class MapHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
 
+        elif self.path == '/health':
+            with MapHandler._data_lock:
+                _data = dict(MapHandler.detections_data)
+            _src = _data.get('sources', [])
+            _health = {'status': 'ok', 'source_count': len(_src),
+                       'server_time': time.time()}
+            json_bytes = json.dumps(_health, default=str).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            self.wfile.write(json_bytes)
+
         elif self.path == '/api/detections':
             with MapHandler._data_lock:
                 data = dict(MapHandler.detections_data)
@@ -5409,9 +5492,30 @@ class LiveMapServer:
     def start(self):
         if self.server is not None:
             return  # idempotent: run() calls start() twice (bind once only)
-        self.server = ThreadingHTTPServer(('127.0.0.1', self.port), MapHandler)
+        # FIX 2026-08-12: prefer the configured port (8080 baseline), fall back to
+        # MAP_PORT_FALLBACK only if genuinely occupied. Never silently strand the
+        # operator's bookmarked map URL on a different port.
+        import socket as _socket
+        _ports = [self.port]
+        _fb = getattr(Config, 'MAP_PORT_FALLBACK', None)
+        if _fb and _fb != self.port:
+            _ports.append(_fb)
+        _last_err = None
+        for _p in _ports:
+            try:
+                self.server = ThreadingHTTPServer(('127.0.0.1', _p), MapHandler)
+                self.port = _p
+                break
+            except OSError as _e:
+                _last_err = _e
+                self.server = None
+                print('[MAP] port %d unavailable (%s); trying next' % (_p, _e), flush=True)
+        if self.server is None:
+            print('[MAP] FATAL: could not bind any map port %s: %s' % (_ports, _last_err), flush=True)
+            return
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+        print('[MAP] Map server on http://localhost:%d/' % self.port, flush=True)
     def update(self, data): MapHandler.detections_data = data
     def stop(self):
         if self.server: self.server.shutdown()
@@ -5647,11 +5751,17 @@ class GPSInterface:
 
 
 class HackRFSubprocess:
-    def __init__(self, frequency, sample_rate, gain, bias_tee=False):
+    def __init__(self, frequency, sample_rate, gain, bias_tee=False, sweep=None):
         self.frequency=int(frequency);self.sample_rate=int(sample_rate)
         self.gain=gain;self.bias_tee=bias_tee;self.queue=queue.Queue(maxsize=20)
+        self.sweep=list(sweep) if sweep else None
+        self.sweep_mode=bool(sweep)  # ANTI-BIAS: bridge sweeps all bands internally
         self.active=False;self.proc=None
     def start(self, duration_ms=200):
+        # ANTI-BIAS: open-band sweep requires the PyUSB bridge (CLI can't sweep)
+        if self.sweep_mode:
+            self._start_pyusb(duration_ms)
+            return
         result=subprocess.run(['where','hackrf_transfer'],capture_output=True,text=True)
         if result.returncode!=0:
             print("âš ï¸ hackrf_transfer not found, trying PyUSB"); self._start_pyusb(duration_ms); return
@@ -5679,7 +5789,8 @@ class HackRFSubprocess:
             sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
             from hackrf_usb import HackRFStreamBridge
             self._bridge=HackRFStreamBridge(frequency=self.frequency,sample_rate=self.sample_rate,
-                                            lna_gain=self.gain,vga_gain=self.gain,antenna_power=self.bias_tee)
+                                            lna_gain=self.gain,vga_gain=self.gain,antenna_power=self.bias_tee,
+                                            sweep=self.sweep)
             self._bridge.start(); self.active=True
             print("âœ… HackRF PyUSB bridge active")
         except ImportError:
@@ -5690,12 +5801,23 @@ class HackRFSubprocess:
         if not hasattr(self,'_bridge') or self._bridge is None:
             return None
         try:
-            r = self._bridge.get(timeout=0.05)
+            r = self._bridge.get_latest()
+            if r is None:
+                r = self._bridge.get(timeout=0.05)
             if r is not None and isinstance(r, dict) and 'frequency' not in r:
                 r['frequency'] = self.frequency
             return r
         except:
             return None
+    def get_sweep_report(self):
+        """Latest per-band peak report from the sweeping bridge."""
+        if not hasattr(self, '_bridge') or self._bridge is None:
+            return None
+        try:
+            return self._bridge.get_sweep_report()
+        except Exception:
+            return None
+
     def get(self, timeout=0.05):
         """Get IQ data. For CLI mode uses queue, for PyUSB calls bridge directly."""
         # Try PyUSB bridge first
@@ -5713,7 +5835,11 @@ class HackRFSubprocess:
             except: pass
 
     def retune(self, freq_hz, sample_rate=None):
-        """Retune HackRF to new frequency without full restart."""
+        """Retune HackRF to new frequency without full restart.
+        In sweep mode the bridge advances bands itself - nothing to do."""
+        if self.sweep_mode:
+            self.frequency = int(freq_hz)
+            return True
         if hasattr(self, '_bridge') and self._bridge:
             try:
                 self._bridge.stop()
@@ -5831,10 +5957,16 @@ class RTLSDRCapture:
                 consecutive_failures = 0
                 while self.active:
                     try:
+                        _t0 = time.time()
                         iq = self._read_ctypes(samples_to_read)
                         if iq is not None and len(iq) > 0:
+                            _recv_ts = time.time()
+                            try:
+                                usb_mon.note_capture('rtlsdr', len(iq), capture_start_ts=_t0, recv_ts=_recv_ts)
+                            except Exception:
+                                pass
                             self.queue.put({'data': np.asarray(iq, dtype=np.complex64),
-                                            'timestamp': time.time(),
+                                            'timestamp': _recv_ts,
                                             'frequency': self.frequency})
                             consecutive_failures = 0
                     except Exception as e:
@@ -5931,6 +6063,15 @@ class RTLSDRCapture:
             return self.queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def get_latest(self):
+        latest = None
+        while not self.queue.empty():
+            try:
+                latest = self.queue.get_nowait()
+            except queue.Empty:
+                break
+        return latest
 
     def stop(self):
         self.active = False
@@ -6270,15 +6411,23 @@ class BladeRFCLIBridge:
                                             print(f"âš ï¸ IQ ANOMALY: {w}")
 
                                 self.capture_count += 1
+                                _now_ts = time.time()
+                                _cap_dur = 1048576.0 / float(self.sample_rate)
+                                _cap_start = _now_ts - _cap_dur
                                 self.queue.put({
                                     'iq1':iq1,'iq2':iq2,
-                                    'timestamp':time.time(),
+                                    'timestamp':_now_ts,
+                                    'capture_start':_cap_start,
                                     'capture_id': self.capture_count,
                                     'iq_rms_ch1': float(np.sqrt(np.mean(np.abs(iq1)**2))),
                                     'iq_rms_ch2': float(np.sqrt(np.mean(np.abs(iq2)**2))),
                                     'raw_sha256': hashlib.sha256(raw).hexdigest()[:32],
                                     'integrity_warnings': iq_warnings if not iq_valid else []
                                 })
+                        try:
+                            usb_mon.note_capture('bladerf', len(iq1), capture_start_ts=_cap_start, recv_ts=_now_ts)
+                        except Exception:
+                            pass
                         os.unlink(tmpname)
                 except subprocess.TimeoutExpired:
                     try: proc.kill()
@@ -6366,6 +6515,88 @@ class PettersonMic:
     def start(self):
         if not SOUNDDEVICE_AVAILABLE: return
         import sounddevice as _sd
+        # Resolve Petterson by NAME (robust to index drift from virtual audio devices).
+        # Prefer highest default sample rate: WASAPI 384 kHz beats MME/DirectSound 44.1 kHz.
+        try:
+            _devs = _sd.query_devices()
+            _best = None; _best_sr = 0
+            for _i in range(len(_devs)):
+                if 'petterson' in str(_devs[_i]['name']).lower():
+                    _sr = _devs[_i].get('default_samplerate', 0) or 0
+                    if _sr >= _best_sr:
+                        _best = _i; _best_sr = _sr
+            if _best is not None:
+                self.device_index = _best
+        except Exception:
+            pass
+        # 2026-08-21 fix: if name resolution found no Petterson entry (USB audio
+        # re-enumeration race), do NOT silently open the stale hardcoded index -
+        # that grabbed the NVIDIA Broadcast mic (48kHz, Nyquist 24kHz) and made
+        # every >24kHz ultrasound carrier (c2_us_fsk 24.2kHz, 48.98kHz, 23.7-23.8k
+        # cluster) invisible. Retry resolution for up to 90s; if still absent,
+        # run WITHOUT Petterson (read() returns empty arrays, detectors no-op) and
+        # let the periodic mic re-open logic re-resolve by name later.
+        _pet_ok = False
+        try:
+            for _n in str(sd.query_devices()[self.device_index]['name']).lower() if self.device_index is not None else ['']:
+                if 'petterson' in _n:
+                    _pet_ok = True
+        except Exception:
+            _pet_ok = False
+        if not _pet_ok:
+            logging.getLogger('tscm').warning(
+                'Petterson mic: device %s is NOT a Petterson (USB re-enum race); retrying...' % self.device_index)
+            # PortAudio caches the device list at Pa_Initialize time; a USB audio
+            # device that re-enumerated after process start can be invisible to
+            # query_devices() in this process forever. Force a Pa re-init first.
+            for _attempt in range(18):
+                time.sleep(5)
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                except Exception:
+                    pass
+                try:
+                    _devs = sd.query_devices()
+                    for _i in range(len(_devs)):
+                        if 'petterson' in str(_devs[_i]['name']).lower():
+                            self.device_index = _i
+                            _pet_ok = True
+                            break
+                except Exception:
+                    pass
+                if _pet_ok:
+                    logging.getLogger('tscm').info(
+                        'Petterson mic: retry succeeded -> device %d' % self.device_index)
+                    break
+            if not _pet_ok:
+                # Last resort: the 2026-08-21 live test showed the Petterson
+                # openable by INDEX at 384kHz even while invisible to the name
+                # list (WASAPI endpoint alive, PortAudio enumeration stale).
+                # Probe every input device that reports >= 384000 default rate.
+                try:
+                    _devs = sd.query_devices()
+                    for _i in range(len(_devs)):
+                        _d = _devs[_i]
+                        if _d.get('max_input_channels', 0) >= 1 and (_d.get('default_samplerate') or 0) >= 384000:
+                            try:
+                                _t = sd.InputStream(device=_i, channels=1, samplerate=384000, blocksize=4096)
+                                _t.start(); _t.stop(); _t.close()
+                                self.device_index = _i
+                                _pet_ok = True
+                                logging.getLogger('tscm').info(
+                                    'Petterson mic: found by 384kHz probe -> device %d' % _i)
+                                break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+            if not _pet_ok:
+                logging.getLogger('tscm').warning(
+                    'Petterson mic: STILL ABSENT after 90s retry - running WITHOUT Petterson ultrasonic chain (non-fatal)')
+                self.stream = None
+                self.device_index = None
+                return
         logging.getLogger('tscm').info(f'Petterson mic: trying device {self.device_index}...')
         rates_to_try = [384000, 250000, 192000, 96000, 48000]
         for rate in rates_to_try:
@@ -6435,6 +6666,20 @@ class LaptopMic:
         self.MIC_SPACING = 0.15  # meters between L/R mics
     def start(self):
         if not SOUNDDEVICE_AVAILABLE: return
+        # [AUDIT 2026-08-17] Resolve Intel Smart Sound array by NAME (prefer 4ch),
+        # robust to index drift (same failure mode that grabbed Realtek for Petterson).
+        try:
+            _best = None; _best_score = -1
+            for _i, _d in enumerate(sd.query_devices()):
+                _n = str(_d['name']).lower()
+                if 'intel' in _n and ('smart' in _n or 'array' in _n):
+                    _score = 100 if _d.get('max_input_channels', 0) == 4 else 50
+                    if _score > _best_score:
+                        _best = _i; _best_score = _score
+            if _best is not None:
+                self.device_index = _best
+        except Exception:
+            pass
         if self.device_index is None:
             try:
                 for i,d in enumerate(sd.query_devices()):
@@ -6507,6 +6752,12 @@ class LaptopMic:
                 f'delay={delay_samples}samp brg={bearing_deg:.1f} coh={coherence:.3f} '
                 f'rms(L/R)={l_rms:.4f}/{r_rms:.4f} ch={self._channels}')
         if coherence > 0.08:
+            # FIX 2026-08-12: reject near-axis spurious correlations. Sub-2 deg
+            # bearings are sub-sample-delay crosstalk (|delay| <= 1 sample @ 48k
+            # -> -1.6379 deg artifact seen on 270+ sources with coh up to 0.78).
+            # The array cannot resolve them at ANY coherence - reject unconditionally.
+            if abs(bearing_deg) < 2.0:
+                return None
             self.acoustic_aoa = float(bearing_deg)
             return {'bearing': self.acoustic_aoa, 'coherence': float(coherence)}
         return None
@@ -7514,11 +7765,18 @@ class ClockSyncMonitor:
     def start(self): self.running=True; threading.Thread(target=self._run,daemon=True).start()
     def stop(self): self.running=False
     def _run(self):
+        self._last_skewed = False
         while self.running:
             try:
                 if self.gps and self.gps.has_fix:
                     if self.gps.last_update>0 and abs(time.time()-self.gps.last_update)>1.0:
-                        self.log.warning("â±ï¸ Clock skewed")
+                        if not self._last_skewed:
+                            self.log.warning('Clock skewed (GPS last_update stale - logged once per transition)')
+                        self._last_skewed = True
+                    else:
+                        self._last_skewed = False
+                else:
+                    self._last_skewed = False
                 time.sleep(self.interval)
             except: pass
 
@@ -7577,6 +7835,154 @@ def classify_detection(detector_name, freq=0.0):
     if freq>20000: return 'victim'
     if freq>1e6: return 'transmitter'
     return 'unknown'
+
+def classify_source_origin(detector_name='', classification='unknown', freq=0.0, speech_conf=0.0, is_replay=False):
+    """Classify an acoustic/ultrasonic/sonic source as HUMAN vs SYNTHETIC vs UNKNOWN.
+
+    HUMAN     - real human voice/speech, or biological body emission (victim re-radiation)
+    SYNTHETIC - machine-generated: FSK/BPSK modems, CW tones, beacons, replay loops, unmodulated carriers
+    UNKNOWN   - insufficient data
+    'rf'      - RF-band (>=1 MHz) source: a transmitter, not an acoustic human/synthetic question
+    """
+    d = (detector_name or '').lower()
+    c = (classification or '').lower()
+    try:
+        freq = float(freq)
+    except (TypeError, ValueError):
+        freq = 0.0
+    if freq >= 1e6:
+        return 'rf'
+    if is_replay:
+        return 'synthetic'
+    if any(k in d for k in ('bpsk', 'fsk', 'psk', 'modem', 'beacon', 'cw', 'tone')):
+        if 'voice' not in d:
+            return 'synthetic'
+    if any(k in d for k in ('voice', 'speech', 'v2k', 'ai_voice', 'eardrum', 'silent_sound')):
+        if speech_conf > 0.5:
+            return 'human'
+        if 'carrier' in d or 'silent_sound' in d:
+            return 'synthetic'
+        return 'human'
+    if c == 'victim':
+        if any(k in d for k in ('carbon', 'victim_2k', 'injection', 'body', 'biometric', 'eeg', 'brain', 'eardrum')):
+            return 'human'
+        return 'synthetic'
+    if any(k in d for k in ('victim', 'injection_locking', 'body', 'biometric', 'eeg', 'brain', 'nerve')):
+        return 'human'
+    if any(k in d for k in ('constant', 'wideband', 'beat_freq')):
+        return 'synthetic'
+    return 'unknown'
+
+
+def classify_threat_categories(detector_name='', classification='unknown', freq=0.0):
+    """Return the LIST of operator-facing threat categories a detection belongs to.
+
+    Categories are NON-exclusive: mw_voice, human_tracking, tracking, ultrasonic_sonic.
+    A source can be in several (e.g. an ultrasonic voice carrier targeting the body is
+    both ultrasonic_sonic AND human_tracking).
+    """
+    d = (detector_name or '').lower()
+    c = (classification or '').lower()
+    cats = []
+    try:
+        freq = float(freq)
+    except (TypeError, ValueError):
+        freq = 0.0
+    if any(k in d for k in ('mw_voice', 'pll_resonance', 'voice_to_skull', 'forced_thought', 'microwave')):
+        cats.append('mw_voice')
+    if any(k in d for k in ('radar', 'oth_radar', 'tracking', 'tracker', 'mobile', 'cell_tower', 'stingray', 'wifi_c2', 'phone_c2', 'gps_jammer', 'replay', 'probe')):
+        cats.append('tracking')
+    if any(k in d for k in ('radar_water', 'radar_metal', 'biometric', 'retinal', 'ssvep', 'eeg', 'brain', 'nerve_pain', 'pain_perception', 'body', 'victim', 'eardrum')):
+        cats.append('human_tracking')
+    if c == 'victim' and 'human_tracking' not in cats:
+        cats.append('human_tracking')
+    if freq > 0 and freq <= 48000:
+        cats.append('ultrasonic_sonic')
+    elif any(k in d for k in ('us_', 'ultrasonic', 'sonic', 'silent_sound', 'v2k', 'us_voice', 'injection_locking', 'constant_sonic', 'eardrum')):
+        cats.append('ultrasonic_sonic')
+    if not cats:
+        cats.append('other')
+    return cats
+
+_DEVICE_OUI_SUBTYPE = {
+    '00:40:48': 'camera', '28:57:be': 'camera', '8c:e7:48': 'camera', '3c:e3:6b': 'camera',
+    'a0:bd:1d': 'camera', '00:40:8c': 'camera', 'b8:a4:4f': 'camera', '00:1b:44': 'camera',
+    'c0:56:27': 'router', '20:e5:2a': 'router', '9c:d3:6d': 'router', 'e4:ce:8f': 'router',
+    'f4:f2:6d': 'router', '2c:fd:a1': 'router', '08:60:6e': 'router', 'f0:9f:c2': 'router',
+    'dc:9f:db': 'router', '00:1d:70': 'modem', '00:1f:c6': 'modem', 'a4:5e:60': 'modem',
+    '2c:56:dc': 'modem', '00:0a:d9': 'modem', '64:16:66': 'modem',
+}
+
+_DEVICE_REGISTRY = {}
+try:
+    _reg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'device_registry.json')
+    if os.path.exists(_reg_path):
+        with open(_reg_path, 'r', encoding='utf-8') as _rf:
+            _DEVICE_REGISTRY = json.load(_rf)
+except Exception:
+    _DEVICE_REGISTRY = {}
+
+def classify_device_subtype(detector_name='', freq=0.0, note=''):
+    """Return the IoT/network device subtype for a device-typed source, or None.
+    Returns: 'camera' | 'router' | 'modem' | 'other' | None.
+    """
+    d = (detector_name or '').lower()
+    n = (note or '').lower()
+    if any(k in d for k in ('camera', 'cam_', 'ipcam', 'webcam', 'video')):
+        return 'camera'
+    if any(k in n for k in ('camera', 'cam', 'webcam', 'ipcam', 'video')):
+        return 'camera'
+    if any(k in d for k in ('router', 'wifi', 'repeater', 'ap_', 'c2_wifi', 'hidden_network', 'wifi_c2', 'access_point')):
+        return 'router'
+    if any(k in n for k in ('router', 'access point', 'wifi', 'repeater')):
+        return 'router'
+    if any(k in d for k in ('modem', 'cell', 'cellular', 'cable', 'satellite', 'lte', '5g')):
+        return 'modem'
+    if any(k in n for k in ('modem', 'cellular', 'cable', 'lte', '5g')):
+        return 'modem'
+    try:
+        m = re.search(r'([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}', note or '')
+        if m:
+            mac = m.group(0).lower()
+            oui = mac[:8]
+            if oui in _DEVICE_OUI_SUBTYPE:
+                return _DEVICE_OUI_SUBTYPE[oui]
+            ent = _DEVICE_REGISTRY.get(mac)
+            if isinstance(ent, dict) and ent.get('type'):
+                return ent['type']
+            if isinstance(ent, str) and ent:
+                return ent
+    except Exception:
+        pass
+    return 'other'
+
+def classify_source_kind(detector_name='', classification='unknown', freq=0.0, note=''):
+    """Classify WHAT the source physically is: 'human', 'transmitter', 'device', or 'unknown'.
+
+    Fixes the 'camera marked as victim' false positive: a device detected via
+    RF-DNA / WiFi / SDR / camera / router / modem signatures is hardware, never a
+    human victim. Generic ultrasonic carriers default to DEVICE, not HUMAN.
+    """
+    d = (detector_name or '').lower()
+    c = (classification or '').lower()
+    try:
+        freq = float(freq)
+    except (TypeError, ValueError):
+        freq = 0.0
+    if any(k in d for k in ('rf_dna', 'sdr_detect', 'device_fp', 'wifi', 'router', 'repeater', 'ap_', 'c2_wifi', 'hidden_network', 'phone_c2', 'cell_c2', 'camera', 'ipcam', 'webcam', 'modem', 'cell_tower')):
+        return 'device'
+    if any(k in d for k in ('carbon_interaction', 'victim_2k', 'injection_locking', 'body_charging', 'body_parasitic', 'carbon_rectification', 'eardrum_capture', 'biometric', 'eeg', 'brain', 'retinal', 'ssvep', 'radar_water', 'radar_metal')):
+        return 'human'
+    if any(k in d for k in ('ultrasonic_scan', 'low_ultrasound', 'constant_ultrasonic', 'us_wideband', 'us_modem', 'ultrasound_modem', 'beat_freq', 'ultrahet')):
+        return 'device'
+    if any(k in d for k in ('silent_sound', 'us_voice', 'mw_voice', 'pll_resonance', 'forced_thought', 'voice_to_skull', 'c2_', 'beacon', 'radar', 'stingray', 'jamming', 'gps_jammer', 'jammer')):
+        return 'transmitter'
+    if c == 'transmitter' or freq >= 1e6:
+        return 'transmitter'
+    if c == 'victim':
+        return 'human'
+    return 'unknown'
+
 
 
 def identify_frequency(freq_hz):
@@ -8225,47 +8631,71 @@ if not TORCH_AVAILABLE:
 
 # ===================== FREQUENCY SWEEP =====================
 
-HACKRF_SWEEP = [
-    ('S', 2450e6, 20e6, 3),        # 2.45 GHz MW carrier - PRIMARY THREAT, check frequently
-    ('VLF', 100e3, 10e6, 3),       # VLF 100 kHz - power line harmonics
-    ('ELF_SLF', 30e3, 10e6, 5),    # ELF/SLF 30 kHz - Schumann resonance, V2K carrier
-    ('HF', 15e6, 10e6, 5),         # HF 15 MHz - shortwave, number stations
-    ('VHF', 150e6, 20e6, 3),      # VHF band
-    ('UHF', 450e6, 20e6, 1),       # UHF direct capture (base)
-    ('ISM433', 433e6, 20e6, 4),    # 433 MHz ISM - remotes, key fobs, C2, covert
-    ('CELL850', 850e6, 20e6, 3),   # Cellular 850 MHz
-    ('CELL_UL_850', 836e6, 20e6, 2),  # Cellular 850 uplink (824-849 MHz) - phone TX
-    ('CELL_UL_1900', 1880e6, 20e6, 3), # PCS 1900 uplink (1850-1910 MHz) - phone TX
-    ('SATCOM_L', 1550e6, 20e6, 4),     # L-band SATCOM downlink (1.5-1.6 GHz)
-    ('SATCOM_S', 2200e6, 20e6, 4),     # S-band SATCOM (2.0-2.4 GHz)
-    ('SATCOM_C_DL', 3950e6, 20e6, 5),  # C-band SATCOM downlink (3.7-4.2 GHz)
-    ('SATCOM_C_UL', 6150e6, 20e6, 8),  # C-band SATCOM uplink (5.9-6.4 GHz)
-    ('ISM900', 915e6, 20e6, 3),    # ISM 915 MHz
-    ('GPS_L1', 1575e6, 20e6, 5),   # L-band 1.575 GHz - GPS L1 / satcom
-    ('GPS_L2', 1227e6, 20e6, 8),   # GPS L2 1.227 GHz - military GPS
-    ('C', 5800e6, 20e6, 5),       # 5.8 GHz ISM
-    ('UNII1', 5180e6, 20e6, 6),    # WiFi 5GHz UNII-1 (ch 36-48)
-    ('UNII2', 5500e6, 20e6, 6),    # WiFi 5GHz UNII-2A (ch 52-64) - DFS
-    ('UNII3', 5745e6, 20e6, 6),    # WiFi 5GHz UNII-2C/3 (ch 100-144)
-    ('U_NII', 5845e6, 20e6, 6),    # WiFi 5GHz U-NII-4 (ch 149-165)
-    ('X_BAND', 10500e6, 20e6, 8),  # X-band 10.5 GHz - radar/satellite downlink
-    ('KU_LO', 12100e6, 20e6, 10), # Ku-band low 12.1 GHz - satellite downlink
-    ('KU_HI', 14200e6, 20e6, 10), # Ku-band high 14.2 GHz - satellite uplink
-    ('K_BAND', 18000e6, 20e6, 12), # K-band 18 GHz - satellite
-    ('K_KA', 26500e6, 20e6, 12),  # Ka-band 26.5 GHz - 5G mmWave, satellite
-    ('K_HI', 38000e6, 20e6, 15),  # 38 GHz - 5G, satellite
-    ('WIGIG', 59000e6, 10e6, 18),  # 59-60 GHz V-band - WiGig (HackRF max ~6GHz, but check)
-]
-BLADERF_SWEEP = [
-    ('S_BASE', 2400e6, 10e6, 1),   # base: MIMO AoA at 2.4 GHz - PRIMARY
-    ('C_BAND', 5800e6, 20e6, 30),  # 5.8 GHz - WiFi 6E/drone C2
-    ('VHF_LOW', 50e6, 10e6, 40),   # 50 MHz - power line harmonics
-    ('ISM315', 315e6, 20e6, 30),   # 315 MHz ISM - remotes, C2
-    ('ISMMUR', 434e6, 20e6, 30),   # 434 MHz ISM - surveillance
-    ('N258', 26000e6, 20e6, 25),   # 5G NR mmWave n258 (24-29 GHz)
-    ('N257', 28000e6, 20e6, 25),   # 5G NR mmWave n257 (28 GHz)
-    ('KA_38', 38000e6, 20e6, 25),  # 38 GHz Ka-band - 5G, satellite
-]
+def _build_open_raster(named, lo, hi, step, prefix):
+    """Named bands (neutral position labels) + gap-filling raster so the
+    whole span is swept with NO dialed-in priorities. All base dwells = 1;
+    dwell adaptation comes only from observed activity (AdaptiveSweepPrioritizer)."""
+    out = []
+    for name, center, bw, _dwell in named:
+        out.append((name, center, bw, 1))
+    f = lo
+    while f + step <= hi:
+        # Every raster window is kept: named bands add redundancy where they
+        # overlap - NO frequency is left blind (no deterministic holes).
+        center = f + step / 2.0
+        out.append(('%s%04d' % (prefix, int(round(center / 1e6))), center, step, 1))
+        f += step
+    return out
+
+# ANTI-BIAS POLICY (2026-08-16): open sweep, not dialed-in. No band is a
+# "primary threat"; the adversary changes frequencies. Raster fills every
+# gap so any carrier anywhere gets a listen pass. Detectors report the
+# ACTUAL peak frequency found in each window, never an assumed carrier.
+HACKRF_SWEEP = _build_open_raster([
+    ('VLF', 100e3, 10e6, 1),
+    ('ELF_SLF', 30e3, 10e6, 1),
+    ('HF', 15e6, 10e6, 1),
+    ('VHF', 150e6, 20e6, 1),
+    ('UHF', 450e6, 20e6, 1),
+    ('ISM433', 433e6, 20e6, 1),
+    ('CELL850', 850e6, 20e6, 1),
+    ('CELL_UL_850', 836e6, 20e6, 1),
+    ('CELL_UL_1900', 1880e6, 20e6, 1),
+    ('SATCOM_L', 1550e6, 20e6, 1),
+    ('SATCOM_S', 2200e6, 20e6, 1),
+    ('SATCOM_C_DL', 3950e6, 20e6, 1),
+    ('SATCOM_C_UL', 6150e6, 20e6, 1),
+    ('ISM900', 915e6, 20e6, 1),
+    ('GPS_L1', 1575e6, 20e6, 1),
+    ('GPS_L2', 1227e6, 20e6, 1),
+    ('C', 5800e6, 20e6, 1),
+    ('UNII1', 5180e6, 20e6, 1),
+    ('UNII2', 5500e6, 20e6, 1),
+    ('UNII3', 5745e6, 20e6, 1),
+    ('U_NII', 5845e6, 20e6, 1),
+    ('S', 2450e6, 20e6, 1),
+    ('X_BAND', 10500e6, 20e6, 1),
+    ('KU_LO', 12100e6, 20e6, 1),
+    ('KU_HI', 14200e6, 20e6, 1),
+    ('K_BAND', 18000e6, 20e6, 1),
+    ('K_KA', 26500e6, 20e6, 1),
+    ('K_HI', 38000e6, 20e6, 1),
+    ('WIGIG', 59000e6, 10e6, 1),
+], lo=20e6, hi=6000e6, step=20e6, prefix='OPEN_')
+
+BLADERF_SWEEP = _build_open_raster([
+    ('S_BASE', 2400e6, 10e6, 1),
+    ('C_BAND', 5800e6, 20e6, 1),
+    ('VHF_LOW', 50e6, 10e6, 1),
+    ('ISM315', 315e6, 20e6, 1),
+    ('ISMMUR', 434e6, 20e6, 1),
+    ('N258', 26000e6, 20e6, 1),
+    ('N257', 28000e6, 20e6, 1),
+    ('KA_38', 38000e6, 20e6, 1),
+], lo=300e6, hi=3800e6, step=50e6, prefix='B_OPEN_')
+
+# freq -> band name lookup for open-sweep reporting (anti-bias)
+HACKRF_BAND_BY_FREQ = {int(b[1]): b[0] for b in HACKRF_SWEEP}
 class CoordinatedSystemDetector:
     """Detect multi-transmitter coordinated attack system.
     
@@ -8835,8 +9265,19 @@ class AdaptiveSignalIntelligence:
     def save(self):
         try:
             if self.baseline_path:
-                with open(self.baseline_path, 'w') as f:
-                    json.dump({'known': self.known}, f)
+                import tempfile as _tf
+                _d = os.path.dirname(os.path.abspath(self.baseline_path)) or '.'
+                _fd, _tmp = _tf.mkstemp(dir=_d, suffix='.tmp')
+                try:
+                    with os.fdopen(_fd, 'w') as f:
+                        json.dump({'known': self.known}, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(_tmp, self.baseline_path)
+                except Exception:
+                    try: os.remove(_tmp)
+                    except Exception: pass
+                    raise
         except Exception as e:
             print('[AI-ADAPT] baseline save failed: %s' % e, flush=True)
 
@@ -8844,7 +9285,9 @@ class AdaptiveSignalIntelligence:
         freq = float(r.get('freq') or 0)
         det = str(r.get('detector') or 'unknown')
         band = 0 if freq <= 1e6 else (1 if freq <= 100e6 else (2 if freq <= 1e9 else (3 if freq <= 6e9 else 4)))
-        return (band, det[:8])
+        # [AUDIT 2026-08-17] string key: json.dump cannot serialize tuple dict
+        # keys (was silently failing to persist adaptive_baseline.json).
+        return '%d:%s' % (band, det[:8])
 
     def update(self, r):
         now = time.time()
@@ -8852,7 +9295,8 @@ class AdaptiveSignalIntelligence:
         snr = float(r.get('snr') or 0)
         det = str(r.get('detector') or 'unknown')
         key = self._key(r)
-        band = key[0]
+        # [AUDIT 2026-08-17] key is now a string; derive band from freq (not key[0]).
+        band = 0 if freq <= 1e6 else (1 if freq <= 100e6 else (2 if freq <= 1e9 else (3 if freq <= 6e9 else 4)))
         ent = self.known.get(key)
         if ent is None:
             ent = {'count': 0, 'first': now, 'last': now, 'freqs': [], 'snrs': []}
@@ -9347,12 +9791,22 @@ class SourceLifecycleTracker:
 
 class CoOccurrenceTracker:
     """Tracks which sources appear together in the same detection cycle.
-    Sources that frequently co-occur are likely the same physical platform."""
+    Sources that frequently co-occur are likely the same physical platform.
+    [FIX 2026-08-21] O(n^2) pair counting over ALL fingerprints (observed
+    1458 unique fps/cycle -> 1.06M pairs -> ~106MB dict growth per cycle)
+    leaked ~738MB/min and forced supervisor restarts every 10-15 min.
+    Now: (1) only the top-K most persistent sources per cycle are paired,
+    (2) counts decay so stale pairs expire, (3) total entries are capped."""
     def __init__(self):
         self.pair_counts = {}  # (fp_a, fp_b) -> count (sorted tuple)
         self.source_counts = {}  # fp -> total cycle appearances
         self.window = 200  # track last N cycles
         self.cycle_fingerprints = deque(maxlen=self.window)  # sets of fingerprints per cycle
+        self.MAX_PAIRED_SOURCES = 60   # top-K per cycle (K^2/2 = 1770 pairs max)
+        self.MAX_PAIR_ENTRIES = 50000  # hard cap on pair_counts
+        self.MAX_SOURCE_ENTRIES = 5000 # hard cap on source_counts
+        self.DECAY_INTERVAL = 50       # decay every N cycles
+        self._cycles_since_decay = 0
 
     def record_cycle(self, fingerprints):
         """Record which fingerprints appeared this cycle."""
@@ -9360,12 +9814,39 @@ class CoOccurrenceTracker:
         self.cycle_fingerprints.append(fps)
         for fp in fps:
             self.source_counts[fp] = self.source_counts.get(fp, 0) + 1
-        # Count pairs within this cycle
-        fp_list = sorted(fps)
-        for i in range(len(fp_list)):
-            for j in range(i + 1, len(fp_list)):
-                pair = (fp_list[i], fp_list[j])
+        # [FIX 2026-08-21] Pair only the TOP-K most persistent sources.
+        # Ephemeral carrier fingerprints (rf_carrier_*) churn every cycle and
+        # their pairs are noise; persistent sources carry the real signal.
+        ranked = sorted(fps, key=lambda f: -self.source_counts.get(f, 0))
+        top = sorted(ranked[:self.MAX_PAIRED_SOURCES])
+        for i in range(len(top)):
+            for j in range(i + 1, len(top)):
+                pair = (top[i], top[j])
                 self.pair_counts[pair] = self.pair_counts.get(pair, 0) + 1
+        # Periodic decay + hard caps: counts halve every DECAY_INTERVAL cycles,
+        # so pairs need sustained co-occurrence to survive; stale entries die.
+        self._cycles_since_decay += 1
+        if self._cycles_since_decay >= self.DECAY_INTERVAL:
+            self._cycles_since_decay = 0
+            for k in list(self.pair_counts.keys()):
+                c = self.pair_counts[k] - 1
+                if c <= 0:
+                    del self.pair_counts[k]
+                else:
+                    self.pair_counts[k] = c
+            for k in list(self.source_counts.keys()):
+                c = self.source_counts[k] - 1
+                if c <= 0:
+                    del self.source_counts[k]
+                else:
+                    self.source_counts[k] = c
+        if len(self.pair_counts) > self.MAX_PAIR_ENTRIES:
+            # keep the highest-count pairs
+            keep = sorted(self.pair_counts.items(), key=lambda kv: -kv[1])[:self.MAX_PAIR_ENTRIES]
+            self.pair_counts = dict(keep)
+        if len(self.source_counts) > self.MAX_SOURCE_ENTRIES:
+            keep = sorted(self.source_counts.items(), key=lambda kv: -kv[1])[:self.MAX_SOURCE_ENTRIES]
+            self.source_counts = dict(keep)
 
     def get_correlated_pairs(self, min_cycles=5, min_jaccard=0.3):
         """Return source pairs that co-occur significantly.
@@ -11541,14 +12022,58 @@ class NeuralVideoStreamDecoder:
         }
 
 
+def _us_band_rssi(chunk, freq_hz, fs=384000, bw=200):
+    """RMS of a narrow band around freq_hz in the ultrasonic chunk."""
+    try:
+        x = np.asarray(chunk).flatten().astype(np.float64)
+        if len(x) < 1024:
+            return 0.0
+        from scipy.signal import butter, sosfilt
+        nyq = fs / 2.0
+        lo = max(1, freq_hz - bw) / nyq
+        hi = min(nyq - 1, freq_hz + bw) / nyq
+        if hi <= lo:
+            return 0.0
+        sos = butter(4, [lo, hi], btype='band', output='sos')
+        y = sosfilt(sos, x)
+        return float(np.sqrt(np.mean(y ** 2)))
+    except Exception:
+        return 0.0
+
+
+def _emit_us_probe_tone(freq_hz, dur_s=0.35, level=0.12):
+    """Short probe tone via speakers (only if radiable <= 23 kHz).
+    Returns True if a tone was emitted."""
+    if not SOUNDDEVICE_AVAILABLE or freq_hz > 23000 or freq_hz < 100:
+        return False
+    try:
+        import sounddevice as _sd
+        fs = 48000
+        n = int(fs * dur_s)
+        t = np.arange(n) / fs
+        env = np.hanning(n)
+        tone = (level * np.sin(2 * np.pi * freq_hz * t) * env).astype(np.float32)
+        _sd.play(tone, fs, blocking=False)
+        return True
+    except Exception:
+        return False
+
+
 class FreqSweep:
-    def __init__(self):
+    """Open-band sweeper. Base dwell equal everywhere; optional prioritizer
+    extends dwell ONLY on bands with OBSERVED activity (1x-3x, never preset)."""
+    def __init__(self, prioritizer=None):
         self.hbands=HACKRF_SWEEP;self.bbands=BLADERF_SWEEP
+        self.prioritizer=prioritizer
         self.hi=0;self.bi=0;self.hcyc=0;self.bcyc=0  # separate cycle counters per SDR
     def step(self):
         self.hcyc+=1; self.bcyc+=1
         hname,hfreq,hrate,hdwell=self.hbands[self.hi]
         bname,bfreq,brate,bdwell=self.bbands[self.bi]
+        # ANTI-BIAS: dwell adapts to OBSERVED activity only
+        if self.prioritizer is not None:
+            hdwell=max(1,int(round(self.prioritizer.get_dwell_multiplier(hname))))
+            bdwell=max(1,int(round(self.prioritizer.get_dwell_multiplier('bf_'+bname))))
         if self.hcyc>=hdwell:self.hi=(self.hi+1)%len(self.hbands);self.hcyc=0
         if self.bcyc>=bdwell:self.bi=(self.bi+1)%len(self.bbands);self.bcyc=0
         return self.hbands[self.hi][:3],self.bbands[self.bi][:3]
@@ -11573,7 +12098,8 @@ class TSCMSystem:
         # Hardware
         self.gps=GPSInterface(Config.GPS_PORT,Config.GPS_BAUD,Config.GPS_PORT_2,Config.GPS_PORT_3)
         hackrf_freq=Config.HACKRF_FREQ_TARGET+(Config.SPYVERTER_OFFSET if Config.USE_SPYVERTER else 0)
-        self.hackrf=HackRFSubprocess(hackrf_freq,Config.HACKRF_SAMPLE_RATE,Config.HACKRF_GAIN,Config.HACKRF_BIAS_TEE)
+        self.hackrf=HackRFSubprocess(hackrf_freq,Config.HACKRF_SAMPLE_RATE,Config.HACKRF_GAIN,Config.HACKRF_BIAS_TEE,
+                                     sweep=[int(b[1]) for b in HACKRF_SWEEP])  # ANTI-BIAS: open-band sweep
         # RTL-SDR (Nooelec NESDR Smart) - third sensor
         self.rtlsdr = None
         if Config.RTLSDR_ENABLED:
@@ -11597,6 +12123,7 @@ class TSCMSystem:
         self.rf_coherence_queue=queue.Queue(maxsize=10);self.ul_coherence_queue=queue.Queue(maxsize=10)
         # Rolling audio buffer: keeps last 30 seconds of laptop mic for continuous recording
         self.voice_rolling_buf = deque(maxlen=30 * 48000)  # 30s at 48kHz
+        self._eeg_ring = deque(maxlen=48000)  # 1s rolling laptop-mic audio for soundcard BCI proxy
 
         # Detectors
         self.detectors={
@@ -11645,7 +12172,9 @@ class TSCMSystem:
         # Cross-layer parametric attack correlator
         self.cross_layer = CrossLayerParametricCorrelator(window_s=10.0, min_layers=2)
         # Ultrasonic noise jammer (DISABLED by default — requires explicit enable)
-        self.us_jammer = UltrasonicNoiseJammer(output_fs=48000, band=(20000, 23500))
+        self.us_jammer = UltrasonicNoiseJammer(output_fs=48000, band=(20000, 23500),
+            speaker_fallback=Config.JAMMER_SPEAKER_FALLBACK,
+            speaker_device=Config.JAMMER_SPEAKER_DEVICE)
         self.high_power_wifi=HighPowerWiFiDetector()
 
         # Cell tower detection from BladeRF 2.4 GHz data
@@ -11779,9 +12308,9 @@ class TSCMSystem:
         self.noise_cal = NoiseFloorCalibrator(window_size=50)
         self.broadband_jam = BroadbandJamDetector(noise_calibrator=self.noise_cal, baseline_threshold_db=6.0)
         self.neural = NeuralDetector()  # GPU signal intelligence
-        self.sweep = FreqSweep()  # full-spectrum frequency sweeper
-        self.fhss_tracker = FrequencyHoppingTracker(max_window_s=180, min_freq_stops=3)
         self.adaptive_sweep = AdaptiveSweepPrioritizer(HACKRF_SWEEP, BLADERF_SWEEP)
+        self.sweep = FreqSweep(prioritizer=self.adaptive_sweep)  # open-band sweeper
+        self.fhss_tracker = FrequencyHoppingTracker(max_window_s=180, min_freq_stops=3)
         self.threat_engine = ThreatScoringEngine()
         self.coordinated = CoordinatedSystemDetector()
         self.deep_sig = SensoryTelepresenceDetector()  # DeepSig/OmniSig sensory telepresence
@@ -11846,7 +12375,7 @@ class TSCMSystem:
         # Start background pre-render thread for /map.png
         threading.Thread(target=_pre_render_loop, daemon=True, name='map-render').start()
         self.map_server.start()
-        print(f"ðŸ—ºï¸ Map: http://localhost:8081")
+        print(f"ðŸ—ºï¸ Map: http://localhost:8080")
 
         # Start hardware (HackRF may fail - don't block on it)
         if not self.gps.connect(): self.log.warning("GPS not available")
@@ -11961,67 +12490,6 @@ class TSCMSystem:
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s',
                             handlers=[fh, sh])
         return logging.getLogger(__name__)
-
-    # GPS cache to avoid re-opening serial on every cycle
-    _gps_serial = None
-    _gps_last_port = None
-    _gps_last_lat = None
-    _gps_last_lon = None
-    _gps_last_ts = 0
-
-    def _read_gps_position(self, port, timeout=0.5):
-        """Read GGA sentence from GPS on serial port. Returns (lat, lon) or (None, None).
-        Caches serial connection across cycles for efficiency.
-        Anti-spoof: validates lat/lon bounds, fix quality >= 1."""
-        now = time.time()
-        # Return cached position if read within last 2 seconds
-        if now - self._gps_last_ts < 2 and self._gps_last_lat:
-            return self._gps_last_lat, self._gps_last_lon
-        try:
-            import serial
-            if self._gps_serial is None or self._gps_last_port != port or not self._gps_serial.is_open:
-                if self._gps_serial:
-                    try: self._gps_serial.close()
-                    except: pass
-                self._gps_serial = serial.Serial(port, Config.GPS_BAUD, timeout=timeout)
-                self._gps_last_port = port
-            ser = self._gps_serial
-            ser.reset_input_buffer()
-            t0 = time.time()
-            while time.time() - t0 < 1.5:
-                line = ser.readline()
-                try: line = line.decode('ascii', errors='ignore').strip()
-                except: continue
-                if not line.startswith('$GPGGA') and not line.startswith('$GNGGA'):
-                    continue
-                parts = line.split(',')
-                if len(parts) < 10: continue
-                # $GPGGA,time,lat,N,lon,E,quality,sats,hdop,alt,M,...
-                fix_quality = parts[6]
-                if fix_quality not in ('1', '2', '4', '5'): continue  # no fix
-                lat_str = parts[2]; lat_dir = parts[3]
-                lon_str = parts[4]; lon_dir = parts[5]
-                if not lat_str or not lon_str: continue
-                try:
-                    lat_dd = float(lat_str[:2]) + float(lat_str[2:]) / 60.0
-                    if lat_dir == 'S': lat_dd = -lat_dd
-                    lon_dd = float(lon_str[:3]) + float(lon_str[3:]) / 60.0
-                    if lon_dir == 'W': lon_dd = -lon_dd
-                except (ValueError, IndexError):
-                    continue
-                if abs(lat_dd) < 0.1 or abs(lon_dd) < 0.1: continue
-                self._gps_last_lat = lat_dd
-                self._gps_last_lon = lon_dd
-                self._gps_last_ts = now
-                return lat_dd, lon_dd
-        except Exception as e:
-            # GPS port unavailable — clean up cached serial
-            if self._gps_serial:
-                try: self._gps_serial.close()
-                except: pass
-            self._gps_serial = None
-            self._gps_last_port = None
-        return None, None
 
     def _capture_bladerf(self):
         """Capture from BladeRF CLI bridge."""
@@ -12234,7 +12702,9 @@ class TSCMSystem:
 
     def _on_usb_event(self, msg):
         self.log.warning(f"ðŸ”Œ USB: {msg}")
-        # BladeRF reconnection would go here
+        # Keep map online state truthful: unplug clears sticky, replug awaits fresh capture
+        if 'disappeared' in msg:
+            self._bladerf_last_active = 0
 
     def _process_detection_with_localization(self, det, obs_lat, obs_lon, aoa, source_type='rf', sdr_source='bladerf'):
         """Feed detection to localization engine with AoA + range."""
@@ -12342,7 +12812,7 @@ class TSCMSystem:
         print("="*60)
         print(" TSCM MASTER SUITE v2 - SOURCE LOCALIZATION")
         print("="*60)
-        print(f" Map: http://localhost:8081")
+        print(f" Map: http://localhost:8080")
         print("="*60)
 
         # Background: continuous laptop mic reader for SSTV accumulation
@@ -12469,7 +12939,11 @@ class TSCMSystem:
             iq1,iq2=None,None; bladerf_active=False
             try:
                 iq1,iq2=self._capture_bladerf()
-                if iq1 is not None and len(iq1)>100: bladerf_active=True
+                if iq1 is not None and len(iq1)>100:
+                    bladerf_active=True
+                    self._bladerf_last_active = time.time()
+                elif getattr(self, '_bladerf_last_active', 0) and (time.time() - self._bladerf_last_active) < 120.0:
+                    bladerf_active = True  # sticky online: powered/receiving between bursts; 120s grace absorbs USB/TX stalls
                 # Feed BladeRF 2.4GHz IQ to RF detectors for PLL lock, superhet demod, etc.
                 if bladerf_active and len(iq1) > 1024:
                     for dname in ['pll_resonance','bucket_resonator','ecpri_injection',
@@ -12960,14 +13434,14 @@ class TSCMSystem:
             if hack:
                 iq_hack=hack['data']
                 h_rf_freq = hack.get('frequency', Config.HACKRF_FREQ_TARGET)
-                # Save HackRF spectrum for waterfall logger (every 5 cycles)
-                if self.cycle_count % 5 == 0 and len(iq_hack) >= 4096:
-                    try:
+                # Save HackRF spectrum for waterfall logger (whenever HackRF data is fresh)
+                try:
+                    if len(iq_hack) >= 4096:
                         _wf_fft = np.abs(np.fft.rfft(np.asarray(iq_hack[-4096:], dtype=np.complex128)))
                         _wf_f = np.fft.rfftfreq(4096, 1/Config.HACKRF_SAMPLE_RATE)
                         self._last_hackrf_spectrum = (_wf_f, 20*np.log10(_wf_fft + 1e-12))
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
             #
             # Persist last AoA for ALL cycles (BladeRF may not capture every cycle)
             if self.aoa != 0.0:
@@ -12985,11 +13459,52 @@ class TSCMSystem:
             if hack:
                 iq_hack=hack['data']
                 h_rf_freq = hack.get('frequency', Config.HACKRF_FREQ_TARGET)
+                if getattr(self.hackrf, 'sweep_mode', False) and h_rf_freq:
+                    self._last_hfreq = h_rf_freq  # sweep mode: track current burst band
                 if not self.rf_coherence_queue.full(): self.rf_coherence_queue.put(iq_hack)
                 if not self.rf_coherence_queue.full(): self.rf_coherence_queue.put(iq_hack)
 
+                # OPEN-BAND SWEEP REPORT (ANTI-BIAS): the bridge sweeps every band;
+                # report peaks seen ANYWHERE in the last 30s - no dialed freqs
+                _sweep_rep = None
+                if getattr(self.hackrf, 'sweep_mode', False):
+                    try:
+                        _sweep_rep = self.hackrf.get_sweep_report()
+                    except Exception:
+                        _sweep_rep = None
+                if _sweep_rep:
+                    _now = time.time()
+                    # [FIX 2026-08-21] per-band RF CARRIER log throttle state
+                    if not hasattr(self, '_rf_carrier_log_ts'):
+                        self._rf_carrier_log_ts = {}
+                    for _bf, _brep in _sweep_rep.items():
+                        if _now - float(_brep.get('ts', 0)) > 30.0:
+                            continue
+                        _bn = HACKRF_BAND_BY_FREQ.get(int(_bf), 'OPEN_%04d' % (int(_bf) // 1000000))
+                        for _cf, _snr in _brep.get('peaks', []):
+                            if _cf < 1e6:
+                                continue
+                            # [FIX 2026-08-21] throttle per-band RF CARRIER log spam (was ~1500/min)
+                            _blt = self._rf_carrier_log_ts.get(_bn, 0)
+                            if _now - _blt >= 60.0:
+                                self._rf_carrier_log_ts[_bn] = _now
+                                self.log.info(f"RF CARRIER: {_cf/1e6:.1f} MHz SNR={_snr:.1f} ({_bn})")
+                            self.detectors['forced_thought'].set_carrier(_cf)
+                            self.detectors['pll_resonance'].set_carrier(_cf)
+                            self.fhss_tracker.add_carrier(_cf, float(_snr), _now,
+                                bearing=self.aoa if self.aoa else None, bw=10000, detector='hackrf')
+                            self.doppler_detector.update(_cf, float(_snr), _now)
+                            self.localization.add_observation(
+                                fingerprint=f'rf_carrier_{_cf:.0f}'.encode(),
+                                obs_lat=lat, obs_lon=lon,
+                                bearing_deg=None, range_m=None, freq=_cf,
+                                classification='transmitter',
+                                detector_name='rf_carrier_scan', snr=float(_snr))
+                            self.adaptive_sweep.record_hit(_bn, self.cycle_count)
+                            self.blind_spot.record_detection(_bn, self.cycle_count)
+                    self._last_sweep_report_ts = _now
                 # Quick RF carrier scan: look for narrowband carriers in HackRF band
-                if self.cycle_count % 5 == 0 and len(iq_hack) >= 4096:
+                if _sweep_rep is None and self.cycle_count % 5 == 0 and len(iq_hack) >= 4096:
                     try:
                         fft_hack = np.abs(np.fft.rfft(iq_hack[-4096:]))
                         _scan_center = h_rf_freq if h_rf_freq else Config.HACKRF_FREQ_TARGET
@@ -13389,7 +13904,7 @@ class TSCMSystem:
             # This gives us THREE sensor positions with bearing lines â†’ real triangulation.
             rtlsdr_iq = None
             if self.rtlsdr:
-                rtlsdr_iq = self.rtlsdr.get()
+                rtlsdr_iq = self.rtlsdr.get_latest() if hasattr(self.rtlsdr, 'get_latest') else self.rtlsdr.get()
             rtl_data = None; rtl_freq = Config.RTLSDR_FREQ
             if rtlsdr_iq is not None:
                 rtl_data = rtlsdr_iq['data']
@@ -13466,7 +13981,7 @@ class TSCMSystem:
                 # Laptop mic spatial array - compute acoustic AoA every cycle
                 try:
                     acoustic = self.laptop_mic.compute_acoustic_aoa()
-                    if acoustic:
+                    if acoustic and abs(acoustic['bearing']) >= 2.0:
                         self.log.info(f"ACOUSTIC AoA: {acoustic['bearing']}deg coh={acoustic['coherence']}")
                         self.localization.add_observation(
                             fingerprint=b'audio_aoa',
@@ -13807,6 +14322,7 @@ class TSCMSystem:
                         fp16=False, no_speech_threshold=0.1)
                     text = result.get('text','').strip()
                     if text and len(text) > 1:
+                        self._last_speech_ts = time.time()
                         self.log.info(f'WHISPER: "{text}" bearing={self.aoa}deg')
                         # TTS: speak via SAPI speech engine (crystal-clear voice output)
                         try:
@@ -14015,9 +14531,9 @@ class TSCMSystem:
                 try:
                     lo_fft = np.abs(np.fft.rfft(mid_chunk[-4096:]))
                     lo_freqs = np.fft.rfftfreq(4096, 1/48000)
-                    lo_mask = (lo_freqs >= 15000) & (lo_freqs <= 22000)
+                    lo_mask = (lo_freqs >= 2000) & (lo_freqs <= 24000)  # ANTI-BIAS: open 2-24k
                     lo_noise = np.median(lo_fft[lo_mask]) + 1e-12
-                    lo_peaks, _ = find_peaks(lo_fft[lo_mask], height=lo_noise*2.5, distance=5)
+                    lo_peaks, _ = find_peaks(lo_fft[lo_mask], height=lo_noise*3.5, distance=5)
                     for pk in lo_peaks[:5]:
                         freq = lo_freqs[lo_mask][pk]
                         snr = lo_fft[lo_mask][pk] / lo_noise
@@ -14064,7 +14580,7 @@ class TSCMSystem:
                 except: pass
             # FULL-SPECTRUM OPEN SCAN: detect ANY coherent carrier 0-192kHz
             # No fixed bands - attacker changes frequencies. Find peaks anywhere.
-            if self.cycle_count % 3 == 0 and len(ul_chunk) >= 16384:
+            if len(ul_chunk) >= 16384:  # ANTI-BIAS: open scan EVERY cycle
                 try:
                     scan_data = ul_chunk[-32768:].astype(np.float32) if len(ul_chunk) >= 32768 else ul_chunk[-16384:].astype(np.float32)
                     n_fft = len(scan_data)
@@ -14076,9 +14592,12 @@ class TSCMSystem:
                     self.noise_cal.add_measurement('bladerf_scan', noise_floor)
                     peaks, props = find_peaks(scan_fft, height=noise_floor*3, distance=5, prominence=noise_floor*1.5)
 
-                    for pk in peaks[:10]:  # top 10 carriers
+                    for pk in peaks[:20]:  # ANTI-BIAS: all significant carriers
                         freq = scan_f[pk]
-                        snr = scan_fft[pk] / noise_floor
+                        # Per-peak local noise floor so high-band US carriers
+                        # are not missed because the global floor is low
+                        _l = max(0, pk - 32); _r = min(len(scan_fft), pk + 32)
+                        snr = scan_fft[pk] / (np.median(scan_fft[_l:_r]) + 1e-12)
 
                         if freq < 100:  # skip DC
                             continue
@@ -14128,6 +14647,12 @@ class TSCMSystem:
                             cls = 'transmitter'
                             mod_hint = 'wideband'
 
+                        # ANTI-BIAS probe feed: remember modem-like carriers so the
+                        # US modem probe can locate them at ANY frequency
+                        if det_type in ('us_modem_fsk', 'us_modem_psk') and snr > 5:
+                            if not hasattr(self, 'us_modem_candidates'):
+                                self.us_modem_candidates = deque(maxlen=30)
+                            self.us_modem_candidates.append({'freq': float(freq), 'snr': float(snr), 'ts': time.time()})
                         self.localization.add_observation(
                             fingerprint=f'open_{det_type}_{freq:.0f}',
                             obs_lat=lat, obs_lon=lon,
@@ -14149,7 +14674,7 @@ class TSCMSystem:
                 try:
                     from scipy.signal import butter, sosfilt, find_peaks as _fp
                     het_chunk = ul_chunk[-32768:].astype(np.float32)
-                    lo_sweep = np.linspace(18000, 150000, 64)  # 64 LO steps across full Petterson US band
+                    lo_sweep = np.linspace(18000, min(150000, self.petterson.fs * 0.45), 64)  # 64 LO steps; clamp to Nyquist
                     for lo_freq in lo_sweep:
                         t = np.arange(len(het_chunk)) / self.petterson.fs
                         lo = np.cos(2 * np.pi * lo_freq * t)
@@ -14198,7 +14723,7 @@ class TSCMSystem:
                     # Quick scan for strongest ultrasound carrier
                     scan_fft = np.abs(np.fft.rfft(ul_chunk[-16384:]))
                     scan_f = np.fft.rfftfreq(16384, 1/self.petterson.fs)
-                    us_mask = (scan_f >= 18000) & (scan_f <= 50000)
+                    us_mask = (scan_f >= 2000) & (scan_f <= 180000)  # ANTI-BIAS: open band
                     if np.any(us_mask):
                         pk_idx = np.argmax(scan_fft[us_mask])
                         carrier_freq = scan_f[us_mask][pk_idx]
@@ -14226,7 +14751,7 @@ class TSCMSystem:
                     us_data = ul_chunk[-32768:].astype(np.float32)
                     f_us, t_us, S_us = us_spec(us_data, self.petterson.fs, nperseg=512, noverlap=384)
                     # Find narrowband energy that hops between frequencies
-                    us_mask = (f_us >= 18000) & (f_us <= 50000)
+                    us_mask = (f_us >= 2000) & (f_us <= 180000)  # ANTI-BIAS: open band
                     S_masked = S_us[us_mask, :]
                     # Detect hops: threshold exceedances in time
                     row_max = np.max(S_masked, axis=1)
@@ -14257,10 +14782,12 @@ class TSCMSystem:
                     ul_freqs = np.fft.rfftfreq(8192, 1/self.petterson.fs)
                     # Scan 2kHz-180kHz for ultrasonic sources
                     ul_mask = (ul_freqs >= 2000) & (ul_freqs <= 180000)
-                    ul_peaks, ul_props = find_peaks(ul_fft[ul_mask], height=np.median(ul_fft[ul_mask])*3, distance=10)
+                    ul_peaks, ul_props = find_peaks(ul_fft[ul_mask], height=np.median(ul_fft[ul_mask])*5, distance=10, prominence=np.median(ul_fft[ul_mask])*2)
                     for pk in ul_peaks[:8]:
                         freq = ul_freqs[ul_mask][pk]
                         snr = ul_fft[ul_mask][pk] / (np.median(ul_fft[ul_mask]) + 1e-12)
+                        if snr < 6:  # skip noise-floor peaks
+                            continue
                         self.localization.add_observation(
                             fingerprint=f'ultrasonic_{freq:.0f}'.encode(),
                             obs_lat=lat, obs_lon=lon,
@@ -14277,14 +14804,16 @@ class TSCMSystem:
                     # Scan 18-24 kHz (upper human hearing / lower ultrasonic)
                     lp_mask = (lp_freqs >= 18000) & (lp_freqs <= 24000)
                     lp_noise = np.median(lp_fft[lp_mask]) + 1e-12
-                    lp_peaks, _ = find_peaks(lp_fft[lp_mask], height=lp_noise*2.5, distance=5)
+                    lp_peaks, _ = find_peaks(lp_fft[lp_mask], height=lp_noise*5, distance=5, prominence=lp_noise*2)
                     for pk in lp_peaks[:3]:
                         freq = lp_freqs[lp_mask][pk]
                         snr = lp_fft[lp_mask][pk] / lp_noise
+                        # Pass acoustic AoA from Intel array for 18-24kHz sources
+                        _us_brg = self.laptop_mic.acoustic_aoa if (self.laptop_mic and self.laptop_mic.acoustic_aoa is not None and abs(self.laptop_mic.acoustic_aoa) >= 2.0) else None
                         self.localization.add_observation(
                             fingerprint=f'laptop_ultrasound_{freq:.0f}'.encode(),
                             obs_lat=lat, obs_lon=lon,
-                            bearing_deg=None,
+                            bearing_deg=_us_brg,
                             range_m=None, freq=freq,
                             classification='victim', detector_name='laptop_ultrasound',
                             snr=float(snr))
@@ -14321,14 +14850,14 @@ class TSCMSystem:
                 self.log.info("BCI: soundcard acoustic proxy ACTIVE - looking for brain-rhythm "
                               "(gamma 30-50Hz, beta 13-30, alpha 8-13) AM sidebands on detected "
                               "silent-sound / power-line (Hello Scotty) readback carriers")
+            if len(lpt_chunk) >= 8000:
+                self._eeg_ring.extend(lpt_chunk)
+            elif len(mid_chunk) >= 8000:
+                self._eeg_ring.extend(mid_chunk)
             if getattr(self, '_acoustic_bci_latched', False):
                 try:
-                    _proxy_src = None
-                    if len(lpt_chunk) >= 8000:
-                        _proxy_src = np.asarray(lpt_chunk[-8000:]).flatten().astype(np.float32)
-                    elif len(mid_chunk) >= 24000:
-                        _proxy_src = np.asarray(mid_chunk[-8000:]).flatten().astype(np.float32)
-                    if _proxy_src is not None:
+                    if len(self._eeg_ring) >= 48000:
+                        _proxy_src = np.asarray(list(self._eeg_ring), dtype=np.float32)
                         from scipy.signal import butter as _butter, sosfilt as _sosfilt
                         _carr = _sosfilt(_butter(4, [1500.0, 5000.0], fs=48000.0,
                                                  btype='bandpass', output='sos'), _proxy_src)
@@ -14336,11 +14865,11 @@ class TSCMSystem:
                         _brain = _sosfilt(_butter(6, [4.0, 50.0], fs=48000.0,
                                                   btype='bandpass', output='sos'),
                                           _env - np.mean(_env))
-                        _ds = 8000 // 250
+                        _ds = 48000 // 250  # 48kHz->250Hz decimation (was 8000//250=32 = wrong 1500Hz)
                         _proxy_eeg = np.array([np.mean(np.abs(_brain[i:i+_ds]))
-                                               for i in range(0, 8000, _ds)])[:250]
+                                               for i in range(0, len(_brain), _ds)])
                         _proxy_eeg = (_proxy_eeg - np.mean(_proxy_eeg)) * 100.0
-                        if len(_proxy_eeg) >= 200:
+                        if len(_proxy_eeg) >= 20:
                             for _v in _proxy_eeg:
                                 self.eeg_buffer.append(float(_v))
                             while len(self.eeg_buffer) > 500:
@@ -15403,6 +15932,47 @@ class TSCMSystem:
                     if self.cycle_count % 20 == 0:
                         self.log.debug(f"Re-radiator check: {e}")
 
+            # 11a2. US MODEM PROBE: locate ultrasound modems (randomized, open-band)
+            # Uses modem-like carriers the open scan actually saw. Probe:
+            # baseline RSSI -> probe tone (if speaker-radiable) -> 1.6s later RSSI.
+            # Steady carrier = real modem (locate by RSSI gradient + audio AoA if
+            # in array band); decayed = ambient echo. Never assumes a frequency.
+            if _rnd.random() < 0.12 and hasattr(self, 'us_modem_candidates') and self.us_modem_candidates:
+                try:
+                    _cand = max(self.us_modem_candidates, key=lambda c: c['snr'])
+                    _cf = _cand['freq']
+                    _base = _us_band_rssi(ul_chunk, _cf)
+                    _emitted = _emit_us_probe_tone(_cf, 0.35, 0.12) if _cf <= 23000 else False
+                    time.sleep(0.5)
+                    _late = _us_band_rssi(ul_chunk, _cf)
+                    _steady = (_late / _base) if _base > 1e-9 else 0.0
+                    if _steady > 0.7:
+                        self.log.warning(
+                            f"US MODEM LOCATED: {_cf:.0f}Hz rssi={_base:.4f}->{_late:.4f} "
+                            f"probe={'tone' if _emitted else 'passive'} steady={_steady:.2f}")
+                        self.court.log_anomaly('us_modem_probe',
+                            {'freq': _cf, 'steady': round(_steady, 2),
+                             'rssi': [round(_base, 5), round(_late, 5)]})
+                        self.localization.add_observation(
+                            fingerprint=f'us_modem_probe_{_cf:.0f}',
+                            obs_lat=lat, obs_lon=lon,
+                            bearing_deg=None, range_m=None, freq=_cf,
+                            classification='transmitter',
+                            detector_name='us_modem_probe',
+                            snr=float(_cand['snr']))
+                        if _cf <= 24000:
+                            self.log.info(
+                                f"US MODEM DF: {_cf:.0f}Hz in array band - check audio AoA / rotate to max RSSI")
+                        else:
+                            self.log.info(
+                                f"US MODEM DF: {_cf:.0f}Hz above array band - rotate RV / approach to peak RSSI ({_base:.4f})")
+                    else:
+                        self.log.info(
+                            f"US PROBE: {_cf:.0f}Hz steady={_steady:.2f} - ambient echo, not a modem")
+                except Exception as e:
+                    if self.cycle_count % 20 == 0:
+                        self.log.debug(f"US modem probe: {e}")
+
             # 11b. Active direction probe: TX pulse â†’ RX echo â†’ measure return direction
             # Sends a short pulse at 2.45GHz, then captures the reflection
             # Stronger echo on ch1 = source on left, stronger on ch2 = source on right
@@ -15411,7 +15981,7 @@ class TSCMSystem:
                     self.bladerf_cli.capture_paused = True
                     time.sleep(0.1)
                     # TX a short CW burst (probe pulse)
-                    self.bladerf_cli.tx_params = {'freq': Config.BLADERF_FREQ, 'gain': 50, 'sample_rate': 2000000}
+                    self.bladerf_cli.tx_params = {'freq': int(getattr(self, '_last_bfreq', 0) or Config.BLADERF_FREQ), 'gain': 50, 'sample_rate': 2000000}  # ANTI-BIAS: probe current sweep band
                     time.sleep(0.3)  # short burst
                     self.bladerf_cli.tx_params = None
                     time.sleep(0.1)  # let TX settle
@@ -15576,8 +16146,49 @@ class TSCMSystem:
                         self.bladerf_cli.capture_paused = False
                     except: pass
 
-            # Show ALL sources - ghost_murmur kept for operator tracking (historical)
-            clean_sources = sources
+            # Filter sources for map display: remove meta-analysis artifacts and noise
+            # Exclusion list: detectors that produce no real position data
+            _MAP_EXCLUDE = {'coordinated_system', 'coordinated_c2', 'hackrf_injection_locking'}
+            _META_NO_FREQ = {'parametric_attack_confirmed', 'phased_array', 'watcher_consensus'}
+            # Voice/body-carried detectors that must surface even at zero SNR:
+            # decoded speech / transcription events carry no SNR measurement but are
+            # the highest-value detections (mw_voice, v2k, silent_sound, eardrum, ...).
+            _VOICE_KEEP = ('voice', 'speech', 'whisper', 'v2k', 'victim', 'eardrum',
+                           'silent', 'carbon', 'eeg', 'modem', 'ultra', 'sstv')
+            clean_sources = []
+            for s in sources:
+                det = s.get('detector', '')
+                snr = s.get('snr', 0) or 0
+                freq = s.get('freq', 0) or 0
+                _dl = (det or '').lower()
+                # 1. Skip excluded meta-analysis detectors (logged, not mapped)
+                if det in _MAP_EXCLUDE:
+                    continue
+                # 2. Skip negative-SNR (invalid) sources.
+                if snr < 0:
+                    continue
+                # 3. At-observer sources (no position AND no bearing) are KEPT and
+                #    surfaced in the sidebar panel. These are omnidirectional / body-
+                #    carried detections (mw_voice, v2k, ultrasound modems, carbon
+                #    interaction, EEG voice). They are NOT projected to a fake pin.
+                at_observer = (s.get('lat') is None and s.get('bearing') is None)
+                s['at_observer'] = at_observer
+                # 4. Zero-SNR: drop pure noise EXCEPT at-observer voice/body events.
+                if snr <= 0 and not (at_observer and any(k in _dl for k in _VOICE_KEEP)):
+                    continue
+                # 5. For meta detectors with no freq, only keep if they have real bearing
+                if det in _META_NO_FREQ and freq <= 0 and s.get('bearing') is None:
+                    continue
+                _cats = classify_threat_categories(det, s.get('classification', 'unknown') or 'unknown', freq)
+                _spc = 1.0 if (time.time() - getattr(self, '_last_speech_ts', 0.0)) < 30.0 else 0.0
+                s['origin'] = classify_source_origin(det, s.get('classification', 'unknown') or 'unknown', freq, speech_conf=_spc)
+                s['categories'] = _cats
+                s['category'] = _cats[0] if _cats else 'other'
+                s['targets_human'] = ('human_tracking' in _cats) or ('mw_voice' in _cats)
+                _kind = classify_source_kind(det, s.get('classification', 'unknown') or 'unknown', freq, s.get('note', '') or '')
+                s['source_kind'] = _kind
+                s['device_subtype'] = classify_device_subtype(det, freq, s.get('note', '') or '') if _kind == 'device' else ''
+                clean_sources.append(s)
 
             # Watcher: analyze detections for attacker patterns
             if self.cycle_count % 5 == 0:
@@ -15625,10 +16236,10 @@ class TSCMSystem:
             # HELLO SCOTTY: power line carrier communication detector
             # Detects data signals transmitted through electrical wiring
             # These are omnidirectional (come through the wiring, not through air)
-            if self.cycle_count % 8 == 0 and len(mid_chunk) >= 8192:
+            if self.cycle_count % 8 == 0 and len(lpt_chunk) >= 8192:
                 try:
-                    room_audio = mid_chunk[-8192:].astype(np.float32)
-                    # Power line carriers: 100-500 kHz range (above audio, below radio)
+                    room_audio = lpt_chunk[-8192:].astype(np.float32)
+                    # Power line carriers (X10/Insteon-style): data on 120Hz AC harmonics (120-1800 Hz)
                     # Also check 120Hz harmonics (data modulated onto AC)
                     fft_abs = np.abs(np.fft.rfft(room_audio))
                     fft_f = np.fft.rfftfreq(len(room_audio), 1/48000)
@@ -15737,6 +16348,17 @@ class TSCMSystem:
                             'rtlsdr_lon':getattr(self.localization,'rtlsdr_lon',None),
                             'hackrf_aoa':hackrf_aoa if 'hackrf_aoa' in dir() else 0},
                 'sources':clean_sources,
+                'threat_categories':{
+                    'mw_voice': sum(1 for s in clean_sources if 'mw_voice' in s.get('categories', [])),
+                    'tracking': sum(1 for s in clean_sources if 'tracking' in s.get('categories', [])),
+                    'ultrasonic_sonic': sum(1 for s in clean_sources if 'ultrasonic_sonic' in s.get('categories', [])),
+                    'human_tracking': sum(1 for s in clean_sources if 'human_tracking' in s.get('categories', [])),
+                },
+                'kind_summary':{
+                    'human': sum(1 for s in clean_sources if s.get('source_kind')=='human'),
+                    'transmitter': sum(1 for s in clean_sources if s.get('source_kind')=='transmitter'),
+                    'device': sum(1 for s in clean_sources if s.get('source_kind')=='device'),
+                },
                 'us_spectrum':getattr(self, 'us_spectrum', None),
                 'hidden_signals':self.hidden_hunter.get_report(), 'decoy_subtraction':self.decoy_subtraction.get_stats(),
                 'threat_labels':Config.MAP_THREAT_LABELS,
@@ -15744,8 +16366,9 @@ class TSCMSystem:
                 'top_threats':self.threat_engine.get_top_threats(10),
                 'parametric_correlation': self.cross_layer.get_status(clean_sources),
                 'us_jammer': {'enabled': self.us_jammer.enabled, 'effectiveness': self.us_jammer.effectiveness},
+                'usb_timing': usb_mon.get_report(),
                 'noise_floors':{k: self.noise_cal.get_floor(k) for k in self.noise_cal.calibrated_floors},
-                'adaptive_sweep':{b[0]: self.adaptive_sweep.get_dwell_multiplier(b[0]) for b in HACKRF_SWEEP},
+                'adaptive_sweep':dict(sorted({b[0]: self.adaptive_sweep.get_dwell_multiplier(b[0]) for b in HACKRF_SWEEP if self.adaptive_sweep.band_hits.get(b[0], 0) > 0}.items(), key=lambda kv: -kv[1])[:30]),
                 'blind_spots':self.blind_spot.get_coverage_report(),
                 'modulation_fps':self.mod_fingerprinter.get_fingerprint_summary(),
                 'recent_anomalies':self.cycle_anomaly.get_recent_anomalies(10),
@@ -15834,11 +16457,12 @@ class TSCMSystem:
             self._current_hband_name = h_name
             self._current_bband_name = b_name
 
-            # Retune HackRF if band changed
-            if getattr(self, '_last_hfreq', 0) != h_freq:
+            # Retune HackRF if band changed (sweep-mode bridge retunes itself)
+            if getattr(self, '_last_hfreq', 0) != h_freq and not getattr(self.hackrf, 'sweep_mode', False):
                 self._last_hfreq = h_freq
                 ret = self.hackrf.retune(h_freq, h_rate)
-                self.log.info(f'SWEEP RETUNE: {h_name} -> {h_freq/1e6}MHz rate={h_rate/1e6}MHz ok={ret}')
+                if not h_name.startswith('OPEN_'):
+                    self.log.info(f'SWEEP RETUNE: {h_name} -> {h_freq/1e6}MHz rate={h_rate/1e6}MHz ok={ret}')
                 # Clear detector buffers on retune - stale data at old frequency
                 for dname in ['forced_thought','variac','pll_resonance',
                               'bucket_resonator','ecpri_injection','fingerprinting',
@@ -15886,7 +16510,8 @@ class TSCMSystem:
                     self._last_bfreq = b_freq
                     self.bladerf_cli.freq = int(b_freq)
                     self.bladerf_cli.sample_rate = int(b_rate)
-                    self.log.info(f'BLADERF RETUNE: {b_name} -> {b_freq/1e6}MHz rate={b_rate/1e6}MHz')
+                    if not b_name.startswith('B_OPEN_'):
+                        self.log.info(f'BLADERF RETUNE: {b_name} -> {b_freq/1e6}MHz rate={b_rate/1e6}MHz')
                     # Skip next AoA computation during retune transition
                     self._bladerf_retuning = True
                 else:
@@ -15937,27 +16562,28 @@ class TSCMSystem:
                         })
                 except Exception as e:
                     pass  # security audit non-critical - skip on error
-                    # Neural net inference: classify unknown signals
-                    if self.cycle_count % 10 == 0:
-                        try:
-                            if hack and len(hack['data']) > 512:
-                                neural_results = self.neural.detect(iq=hack['data'][-512:])
-                                for nr in neural_results:
-                                    self.localization.add_observation(
-                                        fingerprint=f"neural_{nr.get('modulation','?')}",
-                                        obs_lat=lat, obs_lon=lon,
-                                        bearing_deg=nr.get('bearing_est'),
-                                        range_m=None,
-                                        freq=float(nr.get('freq_offset', 0)),
-                                        classification=nr.get('classification', 'unknown'),
-                                        detector_name='neural_net',
-                                        snr=float(nr.get('confidence', 0)))
-                                    if nr.get('confidence', 0) > 0.5:
-                                        self.log.info(f"NEURAL: {nr.get('modulation','?')} cls={nr.get('classification','?')} conf={nr.get('confidence',0)}")
-                        except: pass
-                    # Save evidence to disk every cycle
-                    if self.cycle_count % 5 == 0:
-                        self.localization.save_evidence()
+            # Neural net inference: classify unknown signals
+            if self.cycle_count % 10 == 0:
+                try:
+                    if hack and len(hack['data']) > 512:
+                        neural_results = self.neural.detect(iq=hack['data'][-512:])
+                        for nr in neural_results:
+                            self.localization.add_observation(
+                                fingerprint=f"neural_{nr.get('modulation','?')}",
+                                obs_lat=lat, obs_lon=lon,
+                                bearing_deg=nr.get('bearing_est'),
+                                range_m=None,
+                                freq=float(nr.get('freq_offset', 0)),
+                                classification=nr.get('classification', 'unknown'),
+                                detector_name='neural_net',
+                                snr=float(nr.get('confidence', 0)))
+                            if nr.get('confidence', 0) > 0.5:
+                                self.log.info(f"NEURAL: {nr.get('modulation','?')} cls={nr.get('classification','?')} conf={nr.get('confidence',0)}")
+                except: pass
+            # Save evidence to disk every cycle
+            if self.cycle_count % 5 == 0:
+                self.localization.save_evidence()
+                MapHandler.save_state()
             # WIGGLE: Jittered cycle delay â€” adversary cannot predict next capture window
             delay = self.wiggle.next_cycle_delay(nominal_s=0.2)
             time.sleep(delay)

@@ -12,7 +12,7 @@ torch>=1.10.0
 #
 # SDR Hardware Support
 # RTL-SDR (tier 1+)
-pyrtlsdrlib>=0.2.0
+pyrtlsdr>=0.2.0  # [AUDIT 2026-08-17] corrected: package is 'pyrtlsdr', not 'pyrtlsdrlib'
 # HackRF (tier 2+) - falls back to CLI if unavailable
 # pyhackrf  # uncomment if available for your platform
 # BladeRF (tier 3+) - falls back to CLI if unavailable

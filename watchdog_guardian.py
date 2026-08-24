@@ -8,7 +8,11 @@ from datetime import datetime
 
 LOG = r'C:\Users\carpe\.openclaw-autoclaw\workspace\watchdog_guardian.py.log'
 TSCM_SCRIPT = r'C:\Users\carpe\.openclaw-autoclaw\workspace\tscm_final.py'
-PYTHON = r'C:\Program Files\AutoClaw\resources\python\python.exe'
+# [AUDIT 2026-08-17] FIX: the AutoClaw bundled python has NONE of the SDR/DSP deps
+# (numpy/scipy/torch/whisper/rtlsdr/bladerf all missing). Use radioconda, the
+# interpreter that actually runs the suite. NOTE: this script is deprecated in
+# favour of tscm_launcher_supervisor.py; see audit/2026-08-17/03_conflict_analysis.md.
+PYTHON = r'C:\ProgramData\radioconda\python.exe'
 MAP_PORT = 8080
 PID_FILE = r'C:\Users\carpe\.openclaw-autoclaw\workspace\tscm.pid'
 CHECK_INTERVAL = 300
@@ -38,10 +42,12 @@ def is_tscm_running():
         s = socket.socket()
         s.settimeout(3)
         s.connect(('127.0.0.1', MAP_PORT))
-        s.sendall(b'GET / HTTP/1.0\r\n\r\n')
+        s.sendall(b'GET /live HTTP/1.0\r\n\r\n')
         resp = s.recv(64)
         s.close()
-        return b'200' in resp
+        # /live returns 200 directly; / returns 302 -> /live. Accept either so the
+        # redirect doesn't masquerade as a down server.
+        return b'200' in resp or b'302' in resp
     except:
         return False
 
