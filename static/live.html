@@ -270,13 +270,13 @@ function update() {
     gps.className = obs.gps_fix ? 'val ok' : 'val warn';
 
     // Sort by threat priority
-    var threat = {c2:0,attack:1,mw_voice:2,carbon:3,silent:4,eeg:5,ultrasound:6,stingray:0};
+    var threat = {c2:0,attack:1,victim:1,mw_voice:2,carbon:3,silent:4,eeg:5,ultrasound:6,us_modem:6,stingray:0};
     sources.sort(function(a,b){
       var da=(a.detector||'').toLowerCase(),db=(b.detector||'').toLowerCase();
       var pa=99,pb=99;
       for(var k in threat){if(da.indexOf(k)>=0)pa=Math.min(pa,threat[k]);if(db.indexOf(k)>=0)pb=Math.min(pb,threat[k]);}
       if(pa!==pb) return pa-pb;
-      return (b.observations||0)-(a.observations||0);
+      return (b.detection_count||b.observations||0)-(a.detection_count||a.observations||0);
     });
 
     // Sidebar list â€” show ALL sources (with and without coordinates)
